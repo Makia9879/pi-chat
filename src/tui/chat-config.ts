@@ -1,5 +1,5 @@
+import { isAbsolute } from "node:path";
 import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
-
 import {
 	CHAT_CONFIG_PATH,
 	loadChatConfig,
@@ -12,8 +12,10 @@ import type {
 	ChatAccountConfig,
 	ChatConfig,
 	DiscordAccountConfig,
+	FeishuAccountConfig,
 	GondolinConfig,
 	GondolinSecretConfig,
+	RuntimeConfig,
 	TelegramAccountConfig,
 } from "../core/config-types.js";
 import type { DiscoveredChannel, DiscoveredRole, DiscoveredUser, DiscoverySnapshot } from "../core/discovery-types.js";
@@ -22,10 +24,48 @@ import { loadDiscoverySnapshot } from "../discovery-store.js";
 import { refreshAccountSnapshot, updateAccountIdentityFromSnapshot } from "../services/index.js";
 import { selectItem, showNotice, toggleItems } from "./dialogs.js";
 import { createDiscordAccountWithGuidedSetup } from "./discord-setup.js";
+import { addFeishuChannel, configureFeishuCredentials, createFeishuAccountWithGuidedSetup } from "./feishu-setup.js";
 import { addTelegramObservedTargetToAccount, createTelegramAccountWithGuidedSetup } from "./telegram-setup.js";
+
+async function configureRuntime(
+	ctx: ExtensionContext,
+	target: { runtime?: RuntimeConfig },
+	config: ChatConfig,
+): Promise<void> {
+	const mode = await selectItem(ctx, "Execution mode", [
+		{ value: "inherit", label: "Inherit (default: Gondolin)" },
+		{ value: "gondolin", label: "Gondolin micro-VM" },
+		{ value: "local", label: "Local host process (NO isolation)" },
+	]);
+	if (!mode) return;
+	if (
+		mode === "local" &&
+		!(await ctx.ui.confirm(
+			"Unsandboxed execution",
+			"Remote chat users can run commands with your host permissions. Only use trusted users and a dedicated OS account. Continue?",
+		))
+	)
+		return;
+	const dir = await ctx.ui.input(
+		"Absolute host workspace directory (empty uses inherited/default path)",
+		target.runtime?.workspaceDir ?? "/workspace",
+	);
+	if (dir === undefined) return;
+	if (dir.trim() && !isAbsolute(dir.trim())) {
+		await showNotice(ctx, "Invalid workspace", "Use an absolute path", "error");
+		return;
+	}
+	target.runtime = {
+		mode: mode === "inherit" ? undefined : (mode as "local" | "gondolin"),
+		workspaceDir: dir.trim() || undefined,
+	};
+	await saveChatConfig(config);
+	ctx.ui.notify("Runtime saved. Disconnect and reconnect to apply it.", "info");
+}
 
 function accountDescription(account: ChatAccountConfig, snapshot: DiscoverySnapshot | undefined): string {
 	const parts: string[] = [account.service];
+	if (account.service === "feishu") parts.push(account.eventMode ?? "http");
 	if (account.name) parts.push(account.name);
 	if (account.service === "discord") parts.push(account.serverName);
 	else if (snapshot?.identity.userName) parts.push(`@${snapshot.identity.userName}`);
@@ -242,6 +282,7 @@ async function configureDiscoveredChannel(
 	);
 	if (!access) return;
 	account.channels[channelKey] = {
+		...current,
 		id: channel.id,
 		name: channel.name,
 		dm: channel.dm,
@@ -263,12 +304,17 @@ async function configureConfiguredChannel(
 	const snapshot = await loadDiscoverySnapshot(accountId);
 	while (true) {
 		const choice = await selectItem(ctx, `${accountId}/${channelKey}`, [
+			{ value: "runtime", label: "Runtime / workspace" },
 			{ value: "access", label: "Edit access policy" },
 			{ value: "secrets", label: "Secrets", description: secretSummary(channel.gondolin) },
 			{ value: "delete", label: "Delete channel", description: "Remove this configured channel" },
 			{ value: "back", label: "Back" },
 		]);
 		if (!choice || choice === "back") return;
+		if (choice === "runtime") {
+			await configureRuntime(ctx, channel, config);
+			continue;
+		}
 		if (choice === "access") {
 			const access = await promptAccessPolicy(
 				ctx,
@@ -322,6 +368,7 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 				return aConfigured - bConfigured || a.label.localeCompare(b.label);
 			});
 		const choice = await selectItem(ctx, `${accountId} (${account.serverName})`, [
+			{ value: "runtime", label: "Runtime / workspace" },
 			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
 			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
 			{
@@ -359,6 +406,15 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 			}
 			continue;
 		}
+		if (choice === "runtime") {
+			await configureRuntime(ctx, account, config);
+			continue;
+		}
+		const configuredKey = Object.entries(account.channels).find(([, channel]) => channel.id === choice)?.[0];
+		if (configuredKey) {
+			await configureConfiguredChannel(ctx, config, accountId, configuredKey);
+			continue;
+		}
 		const selectedChannel = snapshot?.channels.find((channel) => channel.id === choice);
 		if (selectedChannel) await configureDiscoveredChannel(ctx, config, accountId, selectedChannel, snapshot);
 	}
@@ -367,8 +423,8 @@ async function configureDiscordAccount(ctx: ExtensionContext, accountId: string)
 async function configureTelegramAccount(ctx: ExtensionContext, accountId: string): Promise<void> {
 	while (true) {
 		const config = await loadChatConfig();
-		const account = config.accounts[accountId] as TelegramAccountConfig | undefined;
-		if (!account || account.service !== "telegram") return;
+		const account = config.accounts[accountId] as TelegramAccountConfig | FeishuAccountConfig | undefined;
+		if (!account || (account.service !== "telegram" && account.service !== "feishu")) return;
 		const channelChoices = Object.entries(account.channels).map(([key, channel]) => ({
 			value: key,
 			label: key,
@@ -376,8 +432,20 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 		}));
 		const choice = await selectItem(ctx, `${accountId} (@${account.botUsername ?? "bot"})`, [
 			{ value: "secrets", label: "Secrets", description: secretSummary(account.gondolin) },
-			{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
-			{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
+			{ value: "runtime", label: "Runtime / workspace" },
+			...(account.service === "feishu"
+				? [
+						{ value: "add-chat", label: "Add Feishu chat_id" },
+						{
+							value: "credentials",
+							label: "Edit Feishu credentials / event mode",
+							description: account.eventMode ?? "http (legacy, no eventMode field)",
+						},
+					]
+				: [
+						{ value: "add-dm", label: "Add DM", description: "Pair a DM by sending /start to the bot" },
+						{ value: "add-group", label: "Add group", description: "Observe activity after adding the bot to a group" },
+					]),
 			{ value: "refresh", label: "Refresh bot info" },
 			{ value: "delete", label: "Delete account", description: "Remove account and all configured channels" },
 			...channelChoices,
@@ -392,11 +460,27 @@ async function configureTelegramAccount(ctx: ExtensionContext, accountId: string
 			});
 			continue;
 		}
-		if (choice === "add-dm") {
+		if (choice === "runtime") {
+			await configureRuntime(ctx, account, config);
+			continue;
+		}
+		if (choice === "add-chat" && account.service === "feishu") {
+			await addFeishuChannel(ctx, config, accountId, account);
+			continue;
+		}
+		if (choice === "credentials" && account.service === "feishu") {
+			const next = await configureFeishuCredentials(ctx, account);
+			if (next) {
+				config.accounts[accountId] = next;
+				await saveChatConfig(config);
+			}
+			continue;
+		}
+		if (choice === "add-dm" && account.service === "telegram") {
 			await addTelegramObservedTargetToAccount(ctx, config, accountId, account, "dm");
 			continue;
 		}
-		if (choice === "add-group") {
+		if (choice === "add-group" && account.service === "telegram") {
 			await addTelegramObservedTargetToAccount(ctx, config, accountId, account, "group");
 			continue;
 		}
@@ -424,7 +508,7 @@ async function configureAccount(ctx: ExtensionContext, accountId: string): Promi
 	const account = config.accounts[accountId];
 	if (!account) return;
 	if (account.service === "discord") return configureDiscordAccount(ctx, accountId);
-	if (account.service === "telegram") return configureTelegramAccount(ctx, accountId);
+	if (account.service === "telegram" || account.service === "feishu") return configureTelegramAccount(ctx, accountId);
 }
 
 export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
@@ -440,15 +524,20 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 				.map(async (accountId) => ({ accountId, snapshot: await loadDiscoverySnapshot(accountId) })),
 		);
 		const choice = await selectItem(ctx, "pi-chat accounts", [
+			{ value: "__runtime__", label: "Runtime / workspace" },
 			{ value: "__secrets__", label: "Secrets", description: secretSummary(config.gondolin) },
 			...snapshots.map(({ accountId, snapshot }) => ({
 				value: accountId,
 				label: accountId,
 				description: accountDescription(config.accounts[accountId], snapshot),
 			})),
-			{ value: "__create__", label: "+ Create account", description: "Create a Telegram or Discord account" },
+			{ value: "__create__", label: "+ Create account", description: "Create a Telegram, Discord or Feishu account" },
 		]);
 		if (!choice) return;
+		if (choice === "__runtime__") {
+			await configureRuntime(ctx, config, config);
+			continue;
+		}
 		if (choice === "__secrets__") {
 			await configureSecrets(ctx, "pi-chat secrets", config.gondolin, async (next) => {
 				config.gondolin = next;
@@ -460,10 +549,16 @@ export async function runChatConfigUI(ctx: ExtensionContext): Promise<void> {
 			const serviceChoice = await selectItem(ctx, "Create account", [
 				{ value: "telegram", label: "Telegram" },
 				{ value: "discord", label: "Discord" },
+				{ value: "feishu", label: "Feishu / Lark" },
 			]);
 			if (!serviceChoice) continue;
 			if (serviceChoice === "telegram") {
 				const accountId = await createTelegramAccountWithGuidedSetup(ctx, config);
+				if (accountId) await configureAccount(ctx, accountId);
+				continue;
+			}
+			if (serviceChoice === "feishu") {
+				const accountId = await createFeishuAccountWithGuidedSetup(ctx, config);
 				if (accountId) await configureAccount(ctx, accountId);
 				continue;
 			}

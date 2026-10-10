@@ -1,5 +1,4 @@
 import { randomUUID } from "node:crypto";
-
 import type {
 	ChatLogRecord,
 	CheckpointRecord,
@@ -11,6 +10,7 @@ import type {
 	PendingJob,
 	ResolvedConversation,
 } from "../types.js";
+import { displayPath } from "./execution.js";
 import {
 	acquireConversationLock,
 	appendConversationRecord,
@@ -23,20 +23,10 @@ import {
 	releaseConversationLock,
 } from "./log.js";
 
+export type ChatControlCommand = { name: "stop" | "new" | "compact" | "status" } | { name: "model"; pattern?: string };
+
 function isDMConversation(conversation: ResolvedConversation): boolean {
 	return conversation.channel.dm ?? false;
-}
-
-function toGuestDisplayPath(conversation: ResolvedConversation, localPath: string): string {
-	if (localPath === conversation.workspaceDir || localPath.startsWith(`${conversation.workspaceDir}/`)) {
-		const suffix = localPath.slice(conversation.workspaceDir.length).replace(/^\//, "");
-		return suffix ? `/workspace/${suffix}` : "/workspace";
-	}
-	if (localPath === conversation.sharedDir || localPath.startsWith(`${conversation.sharedDir}/`)) {
-		const suffix = localPath.slice(conversation.sharedDir.length).replace(/^\//, "");
-		return suffix ? `/shared/${suffix}` : "/shared";
-	}
-	return localPath;
 }
 
 function formatTranscriptRecord(conversation: ResolvedConversation, record: ChatLogRecord): string[] {
@@ -48,7 +38,7 @@ function formatTranscriptRecord(conversation: ResolvedConversation, record: Chat
 		lines.push("  attachments:");
 		for (const attachment of record.attachments)
 			lines.push(
-				`  - ${toGuestDisplayPath(conversation, attachment.localPath)}${attachment.mimeType ? ` (${attachment.mimeType})` : ""}`,
+				`  - ${displayPath(conversation, attachment.localPath)}${attachment.mimeType ? ` (${attachment.mimeType})` : ""}`,
 			);
 	}
 	return lines;
@@ -141,7 +131,11 @@ export class ConversationRuntime {
 		return this.isAllowedInput(message);
 	}
 
-	parseControlCommand(input: InboundMessageInput): "stop" | "new" | "compact" | "status" | undefined {
+	allowsInput(input: InboundMessageInput): boolean {
+		return this.isAllowedInput(normalizeInboundMessage(input, this.conversation.botName));
+	}
+
+	parseControlCommand(input: InboundMessageInput): ChatControlCommand | undefined {
 		const normalized = normalizeInboundMessage(input, this.conversation.botName);
 		if (!this.isAllowedInput(normalized)) return undefined;
 		const account = this.conversation.account;
@@ -152,16 +146,20 @@ export class ConversationRuntime {
 			Boolean,
 		);
 		for (const alias of aliases) text = text.replace(new RegExp(`@${escapeRegExp(alias || "")}\\b`, "ig"), " ");
-		const command = text.replace(/\s+/g, " ").trim().toLowerCase();
-		if (command === "stop" || command === "/stop") return "stop";
-		if (command === "new" || command === "/new") return "new";
-		if (command === "compact" || command === "/compact") return "compact";
-		if (command === "status" || command === "/status") return "status";
+		const collapsed = text.replace(/\s+/g, " ").trim();
+		const command = collapsed.toLowerCase();
+		if (command === "stop" || command === "/stop") return { name: "stop" };
+		if (command === "new" || command === "/new") return { name: "new" };
+		if (command === "compact" || command === "/compact") return { name: "compact" };
+		if (command === "status" || command === "/status") return { name: "status" };
+		if (command === "model" || command === "/model") return { name: "model" };
+		const modelArgument = collapsed.match(/^\/?model\s+(\S(?:.*\S)?)$/i);
+		if (modelArgument?.[1]) return { name: "model", pattern: modelArgument[1] };
 		return undefined;
 	}
 
 	matchesStopCommand(input: InboundMessageInput): boolean {
-		return this.parseControlCommand(input) === "stop";
+		return this.parseControlCommand(input)?.name === "stop";
 	}
 
 	private shouldTriggerJob(message: InboundMessageRecord): false | "mention" | "dm" {

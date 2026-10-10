@@ -1,6 +1,6 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import type {
 	AccessPolicy,
@@ -60,8 +60,22 @@ function buildResolvedConversation(
 	if (!account) throw new Error(`Unknown account: ${accountId}`);
 	const accountDir = getAccountStorageDir(accountId);
 	const conversationDir = getChannelStorageDir(accountId, channelKey);
-	const workspaceDir = join(conversationDir, "workspace");
+	const runtime = {
+		mode: channel.runtime?.mode ?? account.runtime?.mode ?? config.runtime?.mode,
+		workspaceDir: channel.runtime?.workspaceDir ?? account.runtime?.workspaceDir ?? config.runtime?.workspaceDir,
+	};
+	const runtimeMode = runtime.mode ?? "gondolin";
+	if (runtimeMode !== "local" && runtimeMode !== "gondolin") throw new Error(`Unknown runtime mode: ${runtimeMode}`);
+	if (runtime.workspaceDir !== undefined && !isAbsolute(runtime.workspaceDir))
+		throw new Error("runtime.workspaceDir must be an absolute host path");
+	const workspaceDir = resolve(
+		runtime.workspaceDir ?? (runtimeMode === "local" ? "/workspace" : join(conversationDir, "workspace")),
+	);
+	const sharedDir = join(accountDir, "shared");
 	return {
+		runtimeMode,
+		workspacePath: runtimeMode === "local" ? workspaceDir : "/workspace",
+		sharedPath: runtimeMode === "local" ? sharedDir : "/shared",
 		service: account.service,
 		botName: config.botName?.trim() || "pi",
 		accountId,
@@ -73,12 +87,12 @@ function buildResolvedConversation(
 		access: mergeAccess(account.access, channel.access),
 		gondolinSecrets: mergeGondolinSecrets(config.gondolin, account.gondolin, channel.gondolin),
 		accountDir,
-		sharedDir: join(accountDir, "shared"),
+		sharedDir,
 		conversationDir,
 		workspaceDir,
 		gondolinDir: join(conversationDir, "gondolin"),
 		accountMemoryPath: join(accountDir, "shared", "memory.md"),
-		channelMemoryPath: join(conversationDir, "workspace", "memory.md"),
+		channelMemoryPath: join(workspaceDir, "memory.md"),
 		logPath: join(conversationDir, "channel.jsonl"),
 		filesDir: join(workspaceDir, "incoming"),
 		lockPath: join(conversationDir, ".lock"),
@@ -99,9 +113,15 @@ export async function removeChannelStorage(accountId: string, channelKey: string
 	await rm(getChannelStorageDir(accountId, channelKey), { recursive: true, force: true });
 }
 
+export async function writePrivateConfigFile(path: string, config: ChatConfig): Promise<void> {
+	await mkdir(dirname(path), { recursive: true });
+	await writeFile(path, `${JSON.stringify(config, null, "\t")}\n`, { encoding: "utf8", mode: 0o600 });
+	await chmod(path, 0o600);
+}
+
 export async function saveChatConfig(config: ChatConfig): Promise<void> {
 	await ensureChatHome();
-	await writeFile(CHAT_CONFIG_PATH, `${JSON.stringify(config, null, "\t")}\n`, "utf8");
+	await writePrivateConfigFile(CHAT_CONFIG_PATH, config);
 }
 
 export async function loadChatConfig(): Promise<ChatConfig> {
@@ -112,6 +132,7 @@ export async function loadChatConfig(): Promise<ChatConfig> {
 		return {
 			botName: parsed.botName?.trim() || "pi",
 			gondolin: parsed.gondolin,
+			runtime: parsed.runtime,
 			accounts: (parsed.accounts ?? {}) as Record<string, ChatAccountConfig>,
 		};
 	} catch {
@@ -127,6 +148,48 @@ export function listConfiguredConversations(config: ChatConfig): ResolvedConvers
 		}
 	}
 	return conversations.sort((a, b) => a.conversationId.localeCompare(b.conversationId));
+}
+
+export function workspaceConflictWarnings(conversations: ResolvedConversation[]): string[] {
+	const groups = new Map<string, string[]>();
+	for (const conversation of conversations) {
+		const ids = groups.get(conversation.workspaceDir) ?? [];
+		ids.push(conversation.conversationId);
+		groups.set(conversation.workspaceDir, ids);
+	}
+	return [...groups.entries()]
+		.filter(([, ids]) => ids.length > 1)
+		.map(([dir, ids]) => `Workspace ${dir} is shared by: ${ids.join(", ")}`);
+}
+
+/** Missing `eventMode` stays HTTP so previously saved callback configs do not switch transport. */
+export function resolveFeishuEventMode(account: { eventMode?: string }): "websocket" | "http" {
+	if (account.eventMode === undefined) return "http";
+	if (account.eventMode === "websocket" || account.eventMode === "http") return account.eventMode;
+	throw new Error(`Unknown Feishu event mode: ${account.eventMode}`);
+}
+
+export function validateWorkerConversations(conversations: ResolvedConversation[]): void {
+	const apps = new Set<string>();
+	const ports = new Set<number>();
+	for (const conversation of conversations) {
+		const account = conversation.account;
+		if (account.service !== "feishu") continue;
+		const eventMode = resolveFeishuEventMode(account);
+		if (apps.has(account.appId))
+			throw new Error(
+				"Feishu workers require one channel per app. Configure separate apps before spawning all workers.",
+			);
+		apps.add(account.appId);
+		// WebSocket clients do not bind a webhook port. HTTP listeners still must not share one.
+		if (eventMode === "websocket") continue;
+		const port = account.webhook?.port ?? 3000;
+		if (ports.has(port))
+			throw new Error(
+				"Feishu HTTP workers require distinct webhook ports. Configure separate listeners before spawning all workers.",
+			);
+		ports.add(port);
+	}
 }
 
 export function resolveConversation(config: ChatConfig, spec: string): ResolvedConversation | undefined {

@@ -23,6 +23,7 @@ function normalizeDiscord(markdown: string): string {
 
 export function formatMarkdownForService(service: ChatService, markdown: string): RenderedChunkPayload {
 	if (service === "telegram") return { text: normalizeTelegram(markdown), parseMode: "Markdown" };
+	if (service === "feishu") return { text: markdown.trim() };
 	return { text: normalizeDiscord(markdown) };
 }
 

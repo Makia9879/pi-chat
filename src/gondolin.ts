@@ -59,6 +59,9 @@ async function walk(
 }
 
 export class ConversationSandbox {
+	readonly mode = "gondolin" as const;
+	readonly workspacePath = GONDOLIN_WORKSPACE;
+	readonly sharedPath = GONDOLIN_SHARED;
 	readonly conversation: ResolvedConversation;
 	private vm: VM | undefined;
 	private starting: Promise<VM> | undefined;

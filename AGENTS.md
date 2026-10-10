@@ -1,11 +1,11 @@
 # pi-chat
 
-Pi extension bridging Discord and Telegram to a sandboxed pi session via Gondolin micro-VMs.
+Pi extension bridging Discord, Telegram and Feishu/Lark to pi sessions via Gondolin micro-VMs or explicit unsandboxed local execution.
 
 ## Architecture
 
 ```
-Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ pi agent
+Discord/Telegram/Feishu ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ pi agent
                                         ↕
                                    Gondolin VM (Alpine + bash)
                                    /workspace  /shared
@@ -14,7 +14,8 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 - **One VM per connection.** Started on `/chat-connect`, closed on `/chat-disconnect`. `/chat-spawn-all` launches one detached tmux/pi worker per configured channel using the `--chat-conversation <account/channel>` extension flag. `/chat-workers`, `/chat-open-all`, and `/chat-kill-all` manage those workers through tmux. Workers write status JSON to `~/.pi/agent/chat/worker-status/`; the `chat_workers` tool reads it.
 - **One JSONL log per channel.** Append-only event stream: inbound, outbound, job lifecycle.
 - **Trigger-based dispatch.** Mentions in channels, every message in DMs. Triggers queue jobs; jobs produce slices of inbound records for the agent.
-- **Tools run inside the VM.** `read`, `write`, `edit`, `bash` are routed through Gondolin. `chat_history` and `chat_attach` run on the host.
+- **Selectable tool backend.** `read`, `write`, `edit`, `bash` use Gondolin by default or host operations for `runtime.mode: "local"`. `runtime.workspaceDir` selects the host workspace (local default `/workspace`; VM guest stays `/workspace`). `chat_history` and `chat_attach` run on the host. `--chat-local` starts standalone local tools without a channel.
+- **Feishu events.** New accounts use the official SDK WebSocket long connection (`eventMode: "websocket"`) and do not need a public callback URL. Accounts without `eventMode` keep HTTP callbacks with token verification and optional AES/signature checks. One active channel per Feishu app; HTTP workers also need distinct ports.
 
 ## Entry point
 
@@ -36,7 +37,9 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 ### Runtime
 - `src/runtime.ts` — `ConversationRuntime`: log state machine, job queue, slice construction, prompt building, checkpoint management. Owns trigger logic, access policy, control command parsing.
 
-### Gondolin sandbox
+### Execution backends
+- `src/execution.ts` — Backend interface, lazy factory (local mode never loads Gondolin), display paths.
+- `src/local.ts` — Unsandboxed host tools, minimal bash environment, timeout/abort/shutdown process cleanup.
 - `src/gondolin.ts` — `ConversationSandbox`: VM lifecycle, secret environment setup, tool operation factories (read/write/edit/ls/find/grep/bash), guest/host path translation.
 
 ### Secrets
@@ -48,6 +51,7 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 - `src/live/discord.ts` — Discord adapter: discord.js gateway, catch-up pagination, REST message sending with chunking and formatting, reply-to, auto-reconnect on disconnect.
 - `src/live/telegram.ts` — Telegram adapter: long-polling, media group debounce, initial catch-up, chunked sending with Markdown formatting.
 - `src/live/common.ts` — Shared: attachment download/storage, MIME detection, bot mention detection.
+- `src/live/feishu.ts` — HTTP callbacks and official-SDK WebSocket long connection, deduplication, text/post conversion, chunked replies and outbound file uploads.
 
 ### Rendering
 - `src/render/format.ts` — Service-specific markdown normalization and message length limits.
@@ -60,12 +64,14 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 - `src/services/discord.ts` — Discord bot validation, server listing, channel/role/user discovery.
 - `src/services/telegram.ts` — Telegram bot validation, identity fetch.
 - `src/services/types.ts` — Shared service types.
+- `src/services/feishu.ts` — Tenant token cache/refresh, Feishu/Lark REST client and bot identity.
 
 ### TUI
 - `src/tui/chat-config.ts` — `/chat-config` UI: account/channel management, access policy, secrets config.
 - `src/tui/dialogs.ts` — Shared dialog helpers: select, notice, loader, toggle.
 - `src/tui/discord-setup.ts` — Guided Discord account setup (token, server selection, invite flow).
 - `src/tui/telegram-setup.ts` — Guided Telegram account setup (token, DM/group observation).
+- `src/tui/feishu-setup.ts` — Guided app credentials, event mode (WebSocket default for new accounts), and chat ID setup.
 
 ## Storage layout
 
@@ -103,7 +109,7 @@ Discord/Telegram ←→ Live Adapter ←→ Runtime (log, jobs, slices) ←→ p
 
 ## Remote control commands
 
-Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`. Handled before normal ingest in the `onMessage` path.
+Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`, `model`. Handled before normal ingest in the `onMessage` path. `/model` lists authenticated registry models or switches the current pi session model.
 
 ## Secret exchange flow
 
@@ -114,7 +120,7 @@ Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`,
 
 ## Conventions
 
-- `npm run check` = biome + tsc.
+- `npm run check` = biome + tsc (including tests); `npm test` = tsx/Node tests, no QEMU or platform credentials required.
 - No ambient host env leaks into VM.
-- All paths shown to the model use guest-relative paths (`/workspace/...`, `/shared/...`).
+- VM paths shown to the model use guest paths (`/workspace/...`, `/shared/...`); local mode uses actual host workspace/shared paths.
 - Transcript lines include `[uid:ID]` for tamper-resistant user identification.

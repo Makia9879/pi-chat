@@ -1,4 +1,10 @@
-export type ChatService = "telegram" | "discord";
+export type ChatService = "telegram" | "discord" | "feishu";
+
+export interface RuntimeConfig {
+	mode?: "gondolin" | "local";
+	/** Absolute host directory. Local mode defaults to /workspace. */
+	workspaceDir?: string;
+}
 
 export type TriggerMode = "mention" | "message";
 
@@ -19,6 +25,7 @@ export interface GondolinConfig {
 }
 
 export interface ConfiguredChannel {
+	runtime?: RuntimeConfig;
 	id: string;
 	name?: string;
 	dm?: boolean;
@@ -27,6 +34,7 @@ export interface ConfiguredChannel {
 }
 
 export interface BaseAccountConfig {
+	runtime?: RuntimeConfig;
 	service: ChatService;
 	name?: string;
 	access?: AccessPolicy;
@@ -51,15 +59,55 @@ export interface DiscordAccountConfig extends BaseAccountConfig {
 	botUsername?: string;
 }
 
-export type ChatAccountConfig = TelegramAccountConfig | DiscordAccountConfig;
+/** How a Feishu/Lark app receives events. Omitted means HTTP, so old configs stay compatible. */
+export type FeishuEventMode = "websocket" | "http";
+
+/** Account-level Feishu status reactions. `false` disables them; omitted means enabled. */
+export interface FeishuReactionSettings {
+	enabled?: boolean;
+	/** Emoji added while a turn is running. Default `Typing`. */
+	inProgress?: string;
+	/** Emoji added only after `Typing` was removed and the turn failed. Default `CrossMark`. */
+	failure?: string;
+}
+
+export interface FeishuAccountConfig extends BaseAccountConfig {
+	service: "feishu";
+	appId: string;
+	appSecret: string;
+	domain?: "feishu" | "lark";
+	/**
+	 * Status reactions on the triggering message. Default enabled.
+	 * `false` or `{ enabled: false }` turns them off for this account.
+	 * `FEISHU_REACTIONS=false|0|no|off` disables them for the process.
+	 */
+	reactions?: boolean | FeishuReactionSettings;
+	/**
+	 * `websocket` uses the official SDK long connection and needs no public callback URL.
+	 * Missing means `http` so existing callback deployments keep working. New setup UI accounts set `websocket` explicitly.
+	 */
+	eventMode?: FeishuEventMode;
+	/** Required for HTTP callbacks. Unused by WebSocket receive; may be omitted. */
+	verificationToken?: string;
+	encryptKey?: string;
+	webhook?: { host?: string; port?: number; path?: string };
+	botUserId?: string;
+	botUsername?: string;
+}
+
+export type ChatAccountConfig = TelegramAccountConfig | DiscordAccountConfig | FeishuAccountConfig;
 
 export interface ChatConfig {
+	runtime?: RuntimeConfig;
 	botName?: string;
 	gondolin?: GondolinConfig;
 	accounts: Record<string, ChatAccountConfig>;
 }
 
 export interface ResolvedConversation {
+	runtimeMode: "gondolin" | "local";
+	workspacePath: string;
+	sharedPath: string;
 	service: ChatService;
 	botName: string;
 	accountId: string;

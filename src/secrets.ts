@@ -1,26 +1,61 @@
 import { constants, createDecipheriv, generateKeyPairSync, privateDecrypt } from "node:crypto";
+import { chmod, mkdir, writeFile } from "node:fs/promises";
+import { join } from "node:path";
+
+const SECRET_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 
 export interface PendingSecretRequest {
 	name: string;
 	privateKeyPem: string;
+	conversationId: string;
 }
 
 const pendingSecrets = new Map<string, PendingSecretRequest>();
 
-export function createSecretRequest(name: string, description: string): { requestId: string; widgetUrl: string } {
+export function createSecretRequest(
+	name: string,
+	description: string,
+	conversationId: string,
+): { requestId: string; widgetUrl: string } {
+	if (!SECRET_NAME.test(name)) throw new Error("Secret name must be a simple filename");
+	if (!conversationId.trim()) throw new Error("Secret request must be bound to a conversation");
 	const { publicKey, privateKey } = generateKeyPairSync("rsa", {
 		modulusLength: 2048,
 		publicKeyEncoding: { type: "spki", format: "der" },
 		privateKeyEncoding: { type: "pkcs8", format: "pem" },
 	});
 	const requestId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-	pendingSecrets.set(requestId, { name, privateKeyPem: privateKey as string });
+	pendingSecrets.set(requestId, { name, privateKeyPem: privateKey as string, conversationId });
 	const pubB64 = (publicKey as Buffer).toString("base64");
 	const hash = Buffer.from(JSON.stringify({ n: name, d: description, k: pubB64, r: requestId })).toString("base64");
 	return { requestId, widgetUrl: `https://pi.dev/secret#${hash}` };
 }
 
-export function tryDecryptSecret(text: string): { requestId: string; name: string; decrypted: string } | undefined {
+export function clearPendingSecrets(conversationId?: string): void {
+	if (!conversationId) {
+		pendingSecrets.clear();
+		return;
+	}
+	for (const [id, pending] of pendingSecrets) {
+		if (pending.conversationId === conversationId) pendingSecrets.delete(id);
+	}
+}
+
+/** Plaintext runtime secret. Directory 0700 and file 0600, including when the file already existed. */
+export async function writeRuntimeSecret(workspaceDir: string, name: string, content: string): Promise<string> {
+	if (!SECRET_NAME.test(name)) throw new Error("Secret name must be a simple filename");
+	const dir = join(workspaceDir, ".secrets");
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	await chmod(dir, 0o700);
+	const target = join(dir, name);
+	await writeFile(target, content, { encoding: "utf8", mode: 0o600 });
+	await chmod(target, 0o600);
+	return target;
+}
+
+export function tryDecryptSecret(
+	text: string,
+): { requestId: string; name: string; decrypted: string; conversationId: string } | undefined {
 	const match = text.match(/!secret:([^:]+):([A-Za-z0-9+/=]+)/);
 	if (!match) return undefined;
 	const [, requestId, payload] = match;
@@ -42,7 +77,7 @@ export function tryDecryptSecret(text: string): { requestId: string; name: strin
 		d.setAuthTag(tag);
 		const decrypted = Buffer.concat([d.update(ct), d.final()]).toString("utf8");
 		pendingSecrets.delete(requestId);
-		return { requestId, name: pending.name, decrypted };
+		return { requestId, name: pending.name, decrypted, conversationId: pending.conversationId };
 	} catch {
 		return undefined;
 	}

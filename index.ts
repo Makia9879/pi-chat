@@ -1,9 +1,8 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type Dirent, constants as fsConstants } from "node:fs";
+import { type Dirent, constants as fsConstants, mkdirSync } from "node:fs";
 import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative } from "node:path";
-import { ensureGuestAssets, hasGuestAssets } from "@earendil-works/gondolin";
+import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
 	createBashTool,
@@ -25,18 +24,27 @@ import {
 	listConfiguredConversations,
 	loadChatConfig,
 	resolveConversation,
+	validateWorkerConversations,
+	workspaceConflictWarnings,
 } from "./src/config.js";
 
 import type { ResolvedConversation } from "./src/core/config-types.js";
-import { ConversationSandbox, GONDOLIN_SHARED, GONDOLIN_WORKSPACE } from "./src/gondolin.js";
+import { type ConversationExecution, createConversationExecution, displayPath } from "./src/execution.js";
+import { executionSystemPrompt } from "./src/execution-prompt.js";
 import { connectLive } from "./src/live/index.js";
 import type { LiveConnection } from "./src/live/types.js";
+import { formatModelList, formatModelSwitch, resolveChatModel } from "./src/model-command.js";
 import { ConversationRuntime } from "./src/runtime.js";
-import { createSecretRequest, tryDecryptSecret } from "./src/secrets.js";
+import { clearPendingSecrets, createSecretRequest, tryDecryptSecret, writeRuntimeSecret } from "./src/secrets.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
 import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
 
-function buildChatSystemPromptSuffix(service: string, mode: "dm" | "mention", channelName: string): string {
+function buildChatSystemPromptSuffix(
+	service: string,
+	mode: "dm" | "mention",
+	channelName: string,
+	conversation?: ResolvedConversation,
+): string {
 	return `
 
 You are a bot in a remote chat channel.
@@ -78,7 +86,17 @@ Attachments in the transcript are local file paths. Read them as needed.
 To send files back, write them under /workspace and use chat_attach.
 Use chat_history to look up older messages when needed.
 
-Your response is sent as the bot's reply to the remote chat.`;
+Your response is sent as the bot's reply to the remote chat.`
+		.replace(/\/workspace|\/shared/g, (root) =>
+			root === "/workspace" ? (conversation?.workspacePath ?? root) : (conversation?.sharedPath ?? root),
+		)
+		.replace(
+			"The VM runs Alpine Linux with bash and busybox. Use apk to install packages.",
+			conversation?.runtimeMode === "local"
+				? "Tools run directly on the host without VM isolation. Use the host OS tools; do not assume Alpine or apk."
+				: "The VM runs Alpine Linux with bash and busybox. Use apk to install packages.",
+		)
+		.replace("On fresh VM,", conversation?.runtimeMode === "local" ? "On a new session," : "On fresh VM,");
 }
 
 type AssistantSummary = {
@@ -246,14 +264,19 @@ function shellQuote(value: string): string {
 	return `'${value.replace(/'/g, `'"'"'`)}'`;
 }
 
+function resolveExtensionArgument(value: string): string {
+	// Preserve package/URL specifiers; resolve filesystem paths before changing worker cwd.
+	return /^(?:npm:|git:|https?:|builtin:)/.test(value) || isAbsolute(value) ? value : resolve(value);
+}
+
 function explicitExtensionCommandParts(): string[] {
 	const parts: string[] = [];
 	for (let i = 0; i < process.argv.length; i++) {
 		const arg = process.argv[i];
 		if ((arg === "-e" || arg === "--extension") && process.argv[i + 1]) {
-			parts.push(arg, shellQuote(process.argv[++i]));
+			parts.push(arg, shellQuote(resolveExtensionArgument(process.argv[++i])));
 		} else if (arg.startsWith("--extension=")) {
-			parts.push("--extension", shellQuote(arg.slice("--extension=".length)));
+			parts.push("--extension", shellQuote(resolveExtensionArgument(arg.slice("--extension=".length))));
 		}
 	}
 	return parts;
@@ -350,13 +373,14 @@ function createDashboardTmux(): string {
 	return DASHBOARD_TMUX_SESSION;
 }
 
-function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConversation, restart: boolean): string {
+function spawnConversationTmux(_ctx: ExtensionContext, conversation: ResolvedConversation, restart: boolean): string {
 	const tmuxName = tmuxSafeName(conversation.conversationId);
 	if (restart && tmuxSessionExists(tmuxName)) spawnSync("tmux", ["kill-session", "-t", tmuxName], { stdio: "ignore" });
 	if (tmuxSessionExists(tmuxName)) return `${conversation.conversationName}: already running (${tmuxName})`;
 
 	const sessionDir = join(CHAT_HOME, "tmux-sessions", tmuxName);
-	const session = SessionManager.continueRecent(ctx.cwd, sessionDir);
+	mkdirSync(conversation.workspaceDir, { recursive: true });
+	const session = SessionManager.continueRecent(conversation.workspaceDir, sessionDir);
 	session.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId: conversation.conversationId });
 	session.appendSessionInfo(`pi-chat ${conversation.conversationName}`);
 	const sessionFile = session.getSessionFile();
@@ -372,7 +396,7 @@ function spawnConversationTmux(ctx: ExtensionContext, conversation: ResolvedConv
 		`--${CHAT_CONVERSATION_FLAG}`,
 		shellQuote(conversation.conversationId),
 	].join(" ");
-	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", ctx.cwd, command], {
+	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", conversation.workspaceDir, command], {
 		encoding: "utf8",
 	});
 	if (result.error || result.status !== 0) {
@@ -434,9 +458,21 @@ export default function (pi: ExtensionAPI) {
 		type: "string",
 	});
 
+	pi.registerFlag("chat-local", {
+		description: "Start local pi-chat tools without connecting a messaging service",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerFlag("chat-workspace", {
+		description: "Absolute host workspace for --chat-local (default: config runtime.workspaceDir or /workspace)",
+		type: "string",
+	});
+
 	let runtime: ConversationRuntime | undefined;
 	let liveConnection: LiveConnection | undefined;
-	let sandbox: ConversationSandbox | undefined;
+	let sandbox: ConversationExecution | undefined;
+	let executionError: string | undefined;
+	let executionRequired = false;
 	let ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 	let chatTurnInFlight = false;
 	let configLoadedAtLeastOnce = false;
@@ -479,24 +515,33 @@ export default function (pi: ExtensionAPI) {
 		return sandbox !== undefined;
 	}
 
+	function ensureExecutionAvailable(): void {
+		if (executionError) throw new Error(`pi-chat execution backend failed: ${executionError}`);
+		if (executionRequired && !sandbox) throw new Error("pi-chat execution backend is not ready");
+	}
+
 	async function createReadDelegate(ctx: ExtensionContext) {
+		ensureExecutionAvailable();
 		if (!isSandboxActive() || !sandbox) return createReadTool(getLocalToolCwd(ctx));
-		return createReadTool(GONDOLIN_WORKSPACE, { operations: await sandbox.createReadOperations() });
+		return createReadTool(sandbox.workspacePath, { operations: await sandbox.createReadOperations() });
 	}
 
 	async function createWriteDelegate(ctx: ExtensionContext) {
+		ensureExecutionAvailable();
 		if (!isSandboxActive() || !sandbox) return createWriteTool(getLocalToolCwd(ctx));
-		return createWriteTool(GONDOLIN_WORKSPACE, { operations: await sandbox.createWriteOperations() });
+		return createWriteTool(sandbox.workspacePath, { operations: await sandbox.createWriteOperations() });
 	}
 
 	async function createEditDelegate(ctx: ExtensionContext) {
+		ensureExecutionAvailable();
 		if (!isSandboxActive() || !sandbox) return createEditTool(getLocalToolCwd(ctx));
-		return createEditTool(GONDOLIN_WORKSPACE, { operations: await sandbox.createEditOperations() });
+		return createEditTool(sandbox.workspacePath, { operations: await sandbox.createEditOperations() });
 	}
 
 	async function createBashDelegate(ctx: ExtensionContext) {
+		ensureExecutionAvailable();
 		if (!isSandboxActive() || !sandbox) return createBashTool(getLocalToolCwd(ctx));
-		return createBashTool(GONDOLIN_WORKSPACE, { operations: await sandbox.createBashOperations() });
+		return createBashTool(sandbox.workspacePath, { operations: await sandbox.createBashOperations() });
 	}
 
 	async function loadConfigOnce() {
@@ -518,6 +563,7 @@ export default function (pi: ExtensionAPI) {
 
 	async function prepareGondolin(ctx: ExtensionContext): Promise<void> {
 		ensureQemuInstalled();
+		const { ensureGuestAssets, hasGuestAssets } = await import("@earendil-works/gondolin");
 		if (hasGuestAssets()) return;
 		const result = await runWithLoader(ctx, "Preparing Gondolin guest image...", async () => {
 			await ensureGuestAssets();
@@ -536,24 +582,17 @@ export default function (pi: ExtensionAPI) {
 			runtime.conversation.workspaceDir,
 			runtime.conversation.channelMemoryPath,
 		);
-		if (accountMemory.trim()) sections.push(`Account memory (/shared/memory.md):\n${accountMemory.trim()}`);
-		if (channelMemory.trim()) sections.push(`Channel memory (/workspace/memory.md):\n${channelMemory.trim()}`);
+		if (accountMemory.trim())
+			sections.push(`Account memory (${runtime.conversation.sharedPath}/memory.md):\n${accountMemory.trim()}`);
+		if (channelMemory.trim())
+			sections.push(`Channel memory (${runtime.conversation.workspacePath}/memory.md):\n${channelMemory.trim()}`);
 		if (sections.length === 0) return "";
 		return `\n\nPersistent memory:\n${sections.join("\n\n")}`;
 	}
 
 	function hostToGuestPath(hostPath: string): string {
 		if (!runtime) return hostPath;
-		const { workspaceDir, sharedDir } = runtime.conversation;
-		if (hostPath === workspaceDir || hostPath.startsWith(`${workspaceDir}/`)) {
-			const suffix = hostPath.slice(workspaceDir.length).replace(/^\//, "");
-			return suffix ? `/workspace/${suffix}` : "/workspace";
-		}
-		if (hostPath === sharedDir || hostPath.startsWith(`${sharedDir}/`)) {
-			const suffix = hostPath.slice(sharedDir.length).replace(/^\//, "");
-			return suffix ? `/shared/${suffix}` : "/shared";
-		}
-		return hostPath;
+		return displayPath(runtime.conversation, hostPath);
 	}
 
 	async function buildSkillsPromptSuffix(): Promise<string> {
@@ -575,7 +614,50 @@ export default function (pi: ExtensionAPI) {
 			join(runtime.conversation.workspaceDir, "SYSTEM.md"),
 		);
 		if (!systemMd.trim()) return "";
-		return `\n\nSystem configuration log (/workspace/SYSTEM.md):\n${systemMd.trim()}`;
+		return `\n\nSystem configuration log (${runtime.conversation.workspacePath}/SYSTEM.md):\n${systemMd.trim()}`;
+	}
+
+	async function describeModelCommand(ctx: ExtensionContext, pattern?: string): Promise<string> {
+		try {
+			const registry = ctx.modelRegistry;
+			const available = registry.getAvailable().filter((model) => registry.hasConfiguredAuth(model));
+			const scoped = scopedModelRefs(ctx);
+			const models = scoped
+				? available.filter((model) => scoped.some((item) => item.provider === model.provider && item.id === model.id))
+				: available;
+			if (!pattern) {
+				return formatModelList({
+					current: ctx.model,
+					thinking: pi.getThinkingLevel(),
+					models,
+					scoped: Boolean(scoped),
+				});
+			}
+			const resolved = resolveChatModel(pattern, models);
+			if (!resolved.ok) return resolved.text;
+			const switched = await pi.setModel(resolved.model);
+			if (!switched) {
+				return `Could not switch to ${resolved.model.provider}/${resolved.model.id}. Provider ${resolved.model.provider} has no configured authentication.`;
+			}
+			if (resolved.thinkingLevel)
+				pi.setThinkingLevel(resolved.thinkingLevel as Parameters<ExtensionAPI["setThinkingLevel"]>[0]);
+			const thinking = pi.getThinkingLevel();
+			const confirmation = formatModelSwitch(resolved.model, thinking, resolved.thinkingLevel);
+			return chatTurnInFlight ? `${confirmation}\nApplies to the next turn.` : confirmation;
+		} catch (error) {
+			const message = error instanceof Error ? error.message : String(error);
+			return `Model command failed: ${message}`;
+		}
+	}
+
+	function scopedModelRefs(ctx: ExtensionContext): Array<{ provider: string; id: string }> | undefined {
+		const value = (ctx as { scopedModels?: ReadonlyArray<{ model?: { provider?: string; id?: string } }> })
+			.scopedModels;
+		if (!value?.length) return undefined;
+		const scoped = value.flatMap((item) =>
+			item.model?.provider && item.model.id ? [{ provider: item.model.provider, id: item.model.id }] : [],
+		);
+		return scoped.length > 0 ? scoped : undefined;
 	}
 
 	function buildRemoteStatus(ctx: ExtensionContext): string {
@@ -620,8 +702,10 @@ export default function (pi: ExtensionAPI) {
 		if (runtime) {
 			const status = runtime.getStatus();
 			lines.push(`Chat: ${status.conversationName}`);
+			lines.push(`Runtime: ${runtime.conversation.runtimeMode}; workspace: ${runtime.conversation.workspacePath}`);
 			lines.push(`Queue: ${status.queueLength}${status.hasActiveJob ? " (active)" : ""}`);
 		}
+		if (!runtime && sandbox) lines.push(`Runtime: ${sandbox.mode}; workspace: ${sandbox.workspacePath}`);
 		return lines.join("\n") || "No usage data yet.";
 	}
 
@@ -629,9 +713,9 @@ export default function (pi: ExtensionAPI) {
 		const config = await loadChatConfig();
 		const conversation = resolveConversation(config, conversationId);
 		if (!conversation) return false;
-		const nextSandbox = new ConversationSandbox(conversation);
+		const nextSandbox = await createConversationExecution(conversation);
 		try {
-			await prepareGondolin(ctx);
+			if (conversation.runtimeMode === "gondolin") await prepareGondolin(ctx);
 			await nextSandbox.start();
 		} catch (error) {
 			await nextSandbox.close().catch(() => undefined);
@@ -664,7 +748,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		await disconnectRuntime(ctx, false);
 		try {
-			await prepareGondolin(ctx);
+			if (conversation.runtimeMode === "gondolin") await prepareGondolin(ctx);
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			updateStatus(ctx, message);
@@ -673,7 +757,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const result = await runWithLoader(ctx, `Connecting ${conversation.conversationName}...`, async () => {
 			runtime = await ConversationRuntime.connect(conversation, ownerId);
-			sandbox = new ConversationSandbox(conversation);
+			sandbox = await createConversationExecution(conversation);
 			await sandbox.start();
 			liveConnection = await connectLive(
 				conversation,
@@ -682,18 +766,20 @@ export default function (pi: ExtensionAPI) {
 						if (!runtime) return;
 						const secretResult = tryDecryptSecret(input.text);
 						if (secretResult) {
-							if (sandbox) {
-								const vm = await sandbox.start();
-								await vm.fs.mkdir("/workspace/.secrets", { recursive: true });
-								await vm.fs.writeFile(`/workspace/.secrets/${secretResult.name}`, secretResult.decrypted);
-							}
-							await liveConnection?.sendImmediate(
-								`\u2705 Secret received and stored as /workspace/.secrets/${secretResult.name}`,
-							);
+							const allowed = runtime.allowsInput(input);
+							const accepted =
+								runtime.isArmed() && allowed && secretResult.conversationId === runtime.conversation.conversationId;
 							if (checkpoint) await runtime.noteCheckpoint(checkpoint);
+							if (!accepted) {
+								if (allowed) await liveConnection?.sendImmediate("Secret payload was not accepted.");
+								return;
+							}
+							await writeRuntimeSecret(conversation.workspaceDir, secretResult.name, secretResult.decrypted);
+							const storedPath = `${conversation.workspacePath}/.secrets/${secretResult.name}`;
+							await liveConnection?.sendImmediate(`\u2705 Secret received and stored as ${storedPath}`);
 							const notification: typeof input = {
 								...input,
-								text: `[secret stored: ${secretResult.name} at /workspace/.secrets/${secretResult.name}]`,
+								text: `[secret stored: ${secretResult.name} at ${storedPath}]`,
 								mentionedBot: true,
 							};
 							await runtime.ingestInbound(notification, checkpoint);
@@ -701,7 +787,8 @@ export default function (pi: ExtensionAPI) {
 							return;
 						}
 						const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
-						if (control === "stop") {
+						if (control && checkpoint) await runtime.noteCheckpoint(checkpoint);
+						if (control?.name === "stop") {
 							if (chatTurnInFlight || !ctx.isIdle()) {
 								ctx.abort();
 								await liveConnection?.sendImmediate("Aborted current turn.");
@@ -710,7 +797,7 @@ export default function (pi: ExtensionAPI) {
 							}
 							return;
 						}
-						if (control === "compact") {
+						if (control?.name === "compact") {
 							const runCompact = async () => {
 								ctx.compact({
 									onComplete: () => void liveConnection?.sendImmediate("Compaction completed."),
@@ -727,11 +814,15 @@ export default function (pi: ExtensionAPI) {
 							await runCompact();
 							return;
 						}
-						if (control === "status") {
+						if (control?.name === "status") {
 							await liveConnection?.sendImmediate(buildRemoteStatus(ctx));
 							return;
 						}
-						if (control === "new") {
+						if (control?.name === "model") {
+							await liveConnection?.sendImmediate(await describeModelCommand(ctx, control.pattern));
+							return;
+						}
+						if (control?.name === "new") {
 							const queueNewSession = async () => {
 								pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
 								await liveConnection?.sendImmediate("Starting a new pi session.");
@@ -804,7 +895,7 @@ export default function (pi: ExtensionAPI) {
 		const channelName = runtime.conversation.channel.name ?? runtime.conversation.channelKey;
 		const mode = runtime.conversation.channel.dm ? "dm" : "mention";
 		const service = runtime.conversation.service;
-		const systemPromptAdditions = buildChatSystemPromptSuffix(service, mode, channelName).trim();
+		const systemPromptAdditions = buildChatSystemPromptSuffix(service, mode, channelName, runtime.conversation).trim();
 		const accountMemory = await safeReadMountedText(
 			runtime.conversation.sharedDir,
 			runtime.conversation.accountMemoryPath,
@@ -815,8 +906,10 @@ export default function (pi: ExtensionAPI) {
 		);
 		const skillsSuffix = await buildSkillsPromptSuffix();
 		const sections = [`Connected to ${service} ${mode} ${channelName}.`, "", "System prompt:", systemPromptAdditions];
-		if (accountMemory.trim()) sections.push("", "Account memory (/shared/memory.md):", accountMemory.trim());
-		if (channelMemory.trim()) sections.push("", "Channel memory (/workspace/memory.md):", channelMemory.trim());
+		if (accountMemory.trim())
+			sections.push("", `Account memory (${runtime.conversation.sharedPath}/memory.md):`, accountMemory.trim());
+		if (channelMemory.trim())
+			sections.push("", `Channel memory (${runtime.conversation.workspacePath}/memory.md):`, channelMemory.trim());
 		if (skillsSuffix) sections.push("", skillsSuffix.trim());
 		pi.sendMessage({ customType: "chat-context", content: sections.join("\n"), display: true });
 	}
@@ -830,7 +923,7 @@ export default function (pi: ExtensionAPI) {
 			conversationName: status.conversationName,
 			service: runtime.conversation.service,
 			pid: process.pid,
-			cwd: ctx.cwd,
+			cwd: runtime.conversation.workspaceDir,
 			sessionFile: ctx.sessionManager.getSessionFile(),
 			tmuxSession: tmuxSafeName(status.conversationId),
 			state: error ? "error" : "connected",
@@ -872,7 +965,10 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		if (!runtime) {
-			ctx.ui.setStatus("chat", `${label} ${theme.fg("muted", "disconnected")}`);
+			ctx.ui.setStatus(
+				"chat",
+				`${label} ${theme.fg("muted", sandbox ? `${sandbox.mode}: ${sandbox.workspacePath}` : "disconnected")}`,
+			);
 			return;
 		}
 		const status = runtime.getStatus();
@@ -896,6 +992,14 @@ export default function (pi: ExtensionAPI) {
 			typingInterval = undefined;
 		}
 		void liveConnection?.stopTyping();
+	}
+
+	async function markLiveOutcome(outcome: "failure" | "cancelled"): Promise<void> {
+		try {
+			await liveConnection?.markOutcome?.(activeTriggerMessageId, outcome);
+		} catch {
+			// Status reactions are best-effort and must not fail the job path.
+		}
 	}
 
 	pi.registerTool({
@@ -1041,7 +1145,7 @@ export default function (pi: ExtensionAPI) {
 		promptSnippet: "Request a secret from the remote chat user via encrypted input.",
 		promptGuidelines: [
 			"Use chat_request_secret when a skill or setup process needs credentials, API keys, or other sensitive values.",
-			"The secret will be stored at /workspace/.secrets/<name> after the user provides it.",
+			"The secret will be stored at <working directory>/.secrets/<name> after the user provides it.",
 		],
 		parameters: Type.Object({
 			name: Type.String({ description: "Identifier for this secret (used as filename, e.g. gmail-oauth-credentials)" }),
@@ -1055,8 +1159,12 @@ export default function (pi: ExtensionAPI) {
 			);
 		},
 		async execute(_toolCallId, params) {
-			if (!liveConnection) throw new Error("chat_request_secret requires an active chat connection");
-			const { requestId, widgetUrl } = createSecretRequest(params.name, params.description);
+			if (!liveConnection || !runtime) throw new Error("chat_request_secret requires an active chat connection");
+			const { requestId, widgetUrl } = createSecretRequest(
+				params.name,
+				params.description,
+				runtime.conversation.conversationId,
+			);
 			await liveConnection.sendImmediate(
 				`🔑 Secret requested: ${params.description}\n\nOpen this link, paste your secret, then copy the encrypted result back into this chat:\n${widgetUrl}`,
 			);
@@ -1064,7 +1172,7 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Secret request sent to chat (id: ${requestId}). The user will paste the encrypted secret back into chat. It will be stored at /workspace/.secrets/${params.name}. Wait for the user to respond.`,
+						text: `Secret request sent to chat (id: ${requestId}). The user will paste the encrypted secret back into chat. It will be stored at ${runtime?.conversation.workspacePath}/.secrets/${params.name}. Wait for the user to respond.`,
 					},
 				],
 				details: { requestId, name: params.name },
@@ -1092,6 +1200,7 @@ export default function (pi: ExtensionAPI) {
 			pendingChatDispatch = false;
 			chatTurnInFlight = false;
 			stopTypingLoop();
+			await markLiveOutcome("failure");
 			const message = error instanceof Error ? error.message : String(error);
 			await runtime.failActiveJob(`dispatch failed: ${message}`);
 			updateStatus(ctx, message);
@@ -1101,6 +1210,7 @@ export default function (pi: ExtensionAPI) {
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
 		stopTypingLoop();
 		stopWorkerStatusLoop();
+		clearPendingSecrets(runtime?.conversation.conversationId);
 		if (runtime) await writeWorkerStatus(ctx, "disconnected").catch(() => undefined);
 		const connection = liveConnection;
 		liveConnection = undefined;
@@ -1133,7 +1243,7 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("chat-config", {
-		description: "Configure pi-chat Discord and Telegram accounts and channels",
+		description: "Configure pi-chat Discord, Telegram and Feishu accounts and channels",
 		handler: async (_args, ctx) => {
 			await loadConfigOnce();
 			const conversationId = runtime?.conversation.conversationId;
@@ -1189,8 +1299,13 @@ export default function (pi: ExtensionAPI) {
 				ctx.ui.notify(`No configured channels. Run /chat-config. (${CHAT_CONFIG_PATH})`, "warning");
 				return;
 			}
+			validateWorkerConversations(configured);
+			const warnings = workspaceConflictWarnings(configured);
 			const lines = configured.map((conversation) => spawnConversationTmux(ctx, conversation, restart));
-			ctx.ui.notify(`${lines.join("\n")}\n\nAttach with: tmux attach -t <session>`, "info");
+			ctx.ui.notify(
+				`${lines.join("\n")}${warnings.length ? `\n\n${warnings.join("\n")}` : ""}\n\nAttach with: tmux attach -t <session>`,
+				warnings.length ? "warning" : "info",
+			);
 		},
 	});
 
@@ -1349,6 +1464,40 @@ export default function (pi: ExtensionAPI) {
 			typeof flaggedConversationId === "string" && flaggedConversationId.trim()
 				? flaggedConversationId.trim()
 				: persistedConversationId;
+		if (pi.getFlag("chat-local") === true) {
+			executionRequired = true;
+			const failLocal = (message: string): never => {
+				executionError = message;
+				sandbox = undefined;
+				ctx.ui.setStatus("chat", `chat local failed: ${message}`);
+				throw new Error(message);
+			};
+			if (typeof flaggedConversationId === "string" && flaggedConversationId.trim())
+				failLocal("Use either --chat-local or --chat-conversation, not both");
+			const config = await loadChatConfig();
+			const requested = pi.getFlag("chat-workspace");
+			const workspaceDir = (
+				typeof requested === "string" ? requested : (config.runtime?.workspaceDir ?? "/workspace")
+			).trim();
+			if (!isAbsolute(workspaceDir)) failLocal("--chat-workspace must be an absolute path");
+			const { LocalExecution } = await import("./src/local.js");
+			const pending = new LocalExecution({
+				workspaceDir: resolve(workspaceDir),
+				sharedDir: join(CHAT_HOME, "local", "shared"),
+				conversationDir: join(CHAT_HOME, "local"),
+				gondolinSecrets: config.gondolin?.secrets ?? {},
+			});
+			try {
+				await pending.start();
+			} catch (error) {
+				await pending.close().catch(() => undefined);
+				failLocal(error instanceof Error ? error.message : String(error));
+			}
+			sandbox = pending;
+			pi.setActiveTools(["read", "write", "edit", "bash"]);
+			ctx.ui.setStatus("chat", `chat local (unsandboxed): ${sandbox.workspacePath}`);
+			return;
+		}
 		if (conversationId) await connectConversation(ctx, conversationId, false);
 	});
 
@@ -1368,13 +1517,8 @@ export default function (pi: ExtensionAPI) {
 		};
 	});
 
-	pi.on("before_agent_start", async (event) => {
-		const systemPrompt = sandbox
-			? event.systemPrompt.replace(
-					`Current working directory: ${process.cwd()}`,
-					`Current working directory: ${GONDOLIN_WORKSPACE} (Gondolin VM; shared files at ${GONDOLIN_SHARED})`,
-				)
-			: event.systemPrompt;
+	pi.on("before_agent_start", async (event, ctx) => {
+		const systemPrompt = sandbox ? executionSystemPrompt(event.systemPrompt, ctx.cwd, sandbox) : event.systemPrompt;
 		if (!pendingChatDispatch) return sandbox ? { systemPrompt } : undefined;
 		pendingChatDispatch = false;
 		const channelName = runtime?.conversation.channel.name ?? runtime?.conversation.channelKey ?? "chat";
@@ -1386,7 +1530,7 @@ export default function (pi: ExtensionAPI) {
 		return {
 			systemPrompt:
 				systemPrompt +
-				buildChatSystemPromptSuffix(service, mode, channelName) +
+				buildChatSystemPromptSuffix(service, mode, channelName, runtime?.conversation) +
 				memorySuffix +
 				skillsSuffix +
 				systemMdSuffix,
@@ -1402,6 +1546,7 @@ export default function (pi: ExtensionAPI) {
 		const summary = extractAssistantSummary(event.messages as unknown[]);
 		if (summary.stopReason === "aborted") {
 			stopTypingLoop();
+			await markLiveOutcome("cancelled");
 			chatTurnInFlight = false;
 			await runtime.failActiveJob("aborted");
 			const action = pendingControlAction;
@@ -1417,6 +1562,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		if (summary.stopReason === "error" || summary.stopReason === "length") {
 			stopTypingLoop();
+			await markLiveOutcome("failure");
 			chatTurnInFlight = false;
 			const errorMessage = summary.errorMessage || `agent ${summary.stopReason}`;
 			await runtime.failActiveJob(errorMessage);
@@ -1448,11 +1594,13 @@ export default function (pi: ExtensionAPI) {
 				const message = error instanceof Error ? error.message : String(error);
 				chatTurnInFlight = false;
 				if (error instanceof Error && error.name === "AbortError") {
+					await markLiveOutcome("cancelled");
 					await runtime.failActiveJob("aborted");
 					updateStatus(ctx);
 					await tryDispatch(ctx);
 					return;
 				}
+				await markLiveOutcome("failure");
 				await runtime.failActiveJob(`send failed: ${message}`);
 				updateStatus(ctx, message);
 				await tryDispatch(ctx);

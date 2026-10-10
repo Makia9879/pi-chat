@@ -50,6 +50,10 @@ export async function showNotice(
 	message: string,
 	kind: "info" | "warning" | "error" = "info",
 ): Promise<void> {
+	if (!ctx.hasUI) {
+		ctx.ui.notify(`${title}: ${message}`, kind);
+		return;
+	}
 	await ctx.ui.custom<void>((tui, theme, _kb, done) => {
 		const container = new Container();
 		const color = kind === "error" ? "error" : kind === "warning" ? "warning" : "accent";
@@ -76,6 +80,13 @@ export async function runWithLoader<T>(
 	message: string,
 	work: () => Promise<T>,
 ): Promise<{ value?: T; error?: string }> {
+	if (!ctx.hasUI) {
+		try {
+			return { value: await work() };
+		} catch (error) {
+			return { error: error instanceof Error ? error.message : String(error) };
+		}
+	}
 	return ctx.ui.custom<{ value?: T; error?: string }>((tui, theme, _kb, done) => {
 		const loader = new BorderedLoader(tui, theme, message, { cancellable: false });
 		void (async () => {
