@@ -81,12 +81,68 @@ export async function readConversationLog(conversation: ResolvedConversation): P
 	}
 }
 
+const APPEND_LOCK_WAIT_MS = 3_000;
+
+function appendLockPath(conversation: ResolvedConversation): string {
+	return `${conversation.logPath}.append.lock`;
+}
+
+function errorCode(error: unknown): string | undefined {
+	return error && typeof error === "object" && "code" in error ? String((error as { code?: string }).code) : undefined;
+}
+
+async function sleep(ms: number): Promise<void> {
+	await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Short exclusive lock for JSONL appends. This is not the conversation lock:
+ * a local push must not take or block the worker's channel session.
+ */
+export async function withLogAppendLock<T>(conversation: ResolvedConversation, fn: () => Promise<T>): Promise<T> {
+	await ensureConversationDirs(conversation);
+	const lockPath = appendLockPath(conversation);
+	const started = Date.now();
+	for (;;) {
+		try {
+			const handle = await open(lockPath, "wx");
+			try {
+				await handle.writeFile(`${process.pid}\n`, "utf8");
+				return await fn();
+			} finally {
+				await handle.close();
+				await unlink(lockPath).catch(() => undefined);
+			}
+		} catch (error) {
+			if (errorCode(error) !== "EEXIST") throw error;
+			const owner = Number((await readFile(lockPath, "utf8").catch(() => "")).trim());
+			if (Number.isFinite(owner) && !isPidAlive(owner)) {
+				await unlink(lockPath).catch(() => undefined);
+				continue;
+			}
+			if (Date.now() - started > APPEND_LOCK_WAIT_MS) {
+				throw new Error("Channel log append is busy; outbound record was not written");
+			}
+			await sleep(25);
+		}
+	}
+}
+
+/**
+ * Append one JSONL record. Under the append lock, a record id that is already
+ * on disk is bumped so a concurrent writer cannot reuse it or tear a line.
+ */
 export async function appendConversationRecord(
 	conversation: ResolvedConversation,
 	record: ChatLogRecord,
-): Promise<void> {
-	await ensureConversationDirs(conversation);
-	await appendFile(conversation.logPath, `${JSON.stringify(record)}\n`, "utf8");
+): Promise<ChatLogRecord> {
+	return withLogAppendLock(conversation, async () => {
+		const existing = await readConversationLog(conversation);
+		const max = existing.reduce((highest, item) => Math.max(highest, item.recordId), 0);
+		const written = { ...record, recordId: record.recordId > max ? record.recordId : max + 1 };
+		await appendFile(conversation.logPath, `${JSON.stringify(written)}\n`, "utf8");
+		return written;
+	});
 }
 
 function extractOwnerPid(owner: string): number | undefined {

@@ -18,6 +18,7 @@ import {
 } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
+import { formatChatSendResult, parseChatSendArgs, sendConfiguredChat } from "./src/chat-send.js";
 import {
 	CHAT_CONFIG_PATH,
 	CHAT_HOME,
@@ -28,7 +29,6 @@ import {
 	validateWorkerConversations,
 	workspaceConflictWarnings,
 } from "./src/config.js";
-
 import type { ResolvedConversation } from "./src/core/config-types.js";
 import { type ConversationExecution, createConversationExecution, displayPath } from "./src/execution.js";
 import { executionSystemPrompt } from "./src/execution-prompt.js";
@@ -1166,6 +1166,43 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.registerTool({
+		name: "chat_send",
+		label: "Chat Send",
+		description:
+			"Send text, files, or images to a configured channel without connecting a worker or taking the channel lock.",
+		promptSnippet: "Push text, files, or images to a configured chat channel from this local session.",
+		promptGuidelines: [
+			"Use chat_send to deliver a message to a configured account/channel such as feishu/dm.",
+			"It does not connect the channel, open a Feishu websocket, or take the channel lock. Pass conversation, optional text, files, and images.",
+		],
+		parameters: Type.Object({
+			conversation: Type.String({ description: "Configured account/channel, for example feishu/dm" }),
+			text: Type.Optional(Type.String({ description: "Text to send" })),
+			files: Type.Optional(Type.Array(Type.String({ description: "Local file path" }), { maxItems: 10 })),
+			images: Type.Optional(Type.Array(Type.String({ description: "Local image path" }), { maxItems: 10 })),
+		}),
+		renderCall(args, theme) {
+			const target = typeof args.conversation === "string" ? args.conversation : "";
+			return new Text(
+				`${theme.fg("toolTitle", theme.bold("chat_send"))} ${theme.fg("accent", target || "(missing channel)")}`,
+				0,
+				0,
+			);
+		},
+		async execute(_toolCallId, params) {
+			const result = await sendConfiguredChat({
+				conversation: params.conversation,
+				text: params.text,
+				files: params.files,
+				images: params.images,
+			});
+			const text = formatChatSendResult(result);
+			console.log(text);
+			return { content: [{ type: "text", text }], details: result };
+		},
+	});
+
+	pi.registerTool({
 		name: "chat_workers",
 		label: "Chat Workers",
 		description: "Show configured pi-chat worker status from tmux and worker status snapshots.",
@@ -1624,6 +1661,24 @@ export default function (pi: ExtensionAPI) {
 		},
 	});
 
+	pi.registerCommand("chat-send", {
+		description: "Send text, files, or images to a configured channel without connecting",
+		handler: async (args, ctx) => {
+			try {
+				const request = parseChatSendArgs(args);
+				const result = await sendConfiguredChat(request);
+				const text = formatChatSendResult(result);
+				console.log(text);
+				ctx.ui.notify(text, result.logged ? "info" : "warning");
+			} catch (error) {
+				const message = error instanceof Error ? error.message : String(error);
+				console.error(message);
+				ctx.ui.notify(message, "error");
+				throw error instanceof Error ? error : new Error(message);
+			}
+		},
+	});
+
 	pi.on("session_start", async (_event, ctx) => {
 		await loadConfigOnce();
 		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
@@ -1668,6 +1723,7 @@ export default function (pi: ExtensionAPI) {
 			"chat_attach",
 			"chat_request_secret",
 			"chat_workers",
+			"chat_send",
 		]);
 		updateStatus(ctx);
 		const flaggedConversationId = pi.getFlag(CHAT_CONVERSATION_FLAG);

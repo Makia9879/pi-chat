@@ -93,10 +93,11 @@ export class ConversationRuntime {
 		await releaseConversationLock(this.conversation);
 	}
 
-	private async appendRecord(record: ChatLogRecord): Promise<void> {
-		this.records.push(record);
-		this.nextRecordId = Math.max(this.nextRecordId, record.recordId + 1);
-		await appendConversationRecord(this.conversation, record);
+	private async appendRecord<T extends ChatLogRecord>(record: T): Promise<T> {
+		const written = (await appendConversationRecord(this.conversation, record)) as T;
+		this.records.push(written);
+		this.nextRecordId = Math.max(this.nextRecordId, written.recordId + 1);
+		return written;
 	}
 
 	private getLastQueuedTriggerRecordId(): number {
@@ -201,7 +202,7 @@ export class ConversationRuntime {
 		const normalized = normalizeInboundMessage(input, this.conversation.botName);
 		const messageId = normalized.messageId || nextMessageId(this.conversation.service);
 		const attachments = await materializeAttachments(this.conversation, messageId, normalized.attachments);
-		const record: InboundMessageRecord = {
+		const record = await this.appendRecord({
 			type: "inbound",
 			...buildBaseRecordFields(this.conversation, this.nextRecordId),
 			messageId,
@@ -212,19 +213,17 @@ export class ConversationRuntime {
 			mentionedBot: normalized.mentionedBot ?? false,
 			isBot: normalized.isBot ?? false,
 			attachments,
-		};
-		await this.appendRecord(record);
+		} satisfies InboundMessageRecord);
 		if (checkpoint) await this.noteCheckpoint(checkpoint);
 		const trigger = this.shouldTriggerJob(record);
 		if (!trigger || !this.shouldQueueTrigger(record.recordId)) return { record, jobQueued: false };
-		const queuedRecord: JobQueuedRecord = {
+		const queuedRecord = await this.appendRecord({
 			type: "job_queued",
 			...buildBaseRecordFields(this.conversation, this.nextRecordId),
 			jobId: randomUUID(),
 			trigger,
 			triggerRecordId: record.recordId,
-		};
-		await this.appendRecord(queuedRecord);
+		} satisfies JobQueuedRecord);
 		this.pendingJobs.push({
 			jobId: queuedRecord.jobId,
 			trigger: queuedRecord.trigger,
@@ -261,7 +260,7 @@ export class ConversationRuntime {
 		const trimmed = text.trim();
 		if (trimmed.length > 0 || (attachmentPaths?.length ?? 0) > 0) {
 			const triggerRecord = getLatestTriggerRecord(this.records, job);
-			const outbound = {
+			const outbound = await this.appendRecord({
 				type: "outbound",
 				...buildBaseRecordFields(this.conversation, this.nextRecordId),
 				messageId: remoteMessageId || nextMessageId(this.conversation.service),
@@ -269,9 +268,8 @@ export class ConversationRuntime {
 				replyToMessageId: triggerRecord?.messageId,
 				jobId: job.jobId,
 				attachments: attachmentPaths?.length ? [...attachmentPaths] : undefined,
-			} as const;
+			});
 			outboundRecordId = outbound.recordId;
-			await this.appendRecord(outbound);
 		}
 		await this.appendRecord({
 			type: "job_completed",

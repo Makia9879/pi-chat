@@ -27,6 +27,7 @@ export const BLOCKED_CHAT_ADMIN = new Set([
 	"chat-new",
 	"chat-status",
 	"chat-op",
+	"chat-send",
 ]);
 
 const HANDLED = new Set([

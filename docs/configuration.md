@@ -148,6 +148,28 @@ FEISHU_REACTIONS=false
 
 `0`, `no`, and `off` also disable. Any other value, including an unset variable, leaves the account setting in effect. Reaction API errors are logged and do not fail the reply. Publish `im:message.reactions:write_only` with the app version or the add call is rejected and ignored.
 
+## Push a message without connecting
+
+A local pi session can send text, files, and images to a configured channel without becoming that channel's worker. It does not open a Feishu long connection, does not start Discord or Telegram polling, and does not take the channel lock. A running worker can keep receiving events.
+
+```text
+/chat-send <account/channel> [--file path]... [--image path]... [text]
+/chat-send feishu/dm --file /path/a.pdf --image /path/b.png 'hello'
+```
+
+The same action is available to the model as `chat_send` with `conversation`, optional `text`, `files`, and `images`. Feishu uses tenant REST only: text is `im/v1/messages`, files are uploaded to `im/v1/files` and sent as `file` messages, images are uploaded to `im/v1/images` and sent as `image` messages. Discord and Telegram use their bot REST APIs. The command prints each platform `message_id`. Failures name the platform error and do not include app secrets or bot tokens.
+
+Outbound rows are appended to the channel JSONL when the short append lock can be taken. That lock is not the worker's conversation lock. If the log is busy, the send still returns the message ids and says `logged: no`. Remote chat users cannot run `/chat-send`; it is a host command.
+
+Non-interactive print mode runs the slash command directly and does not need a connected worker:
+
+```bash
+pi --no-extensions -e /path/to/pi-chat/index.ts --no-session \
+  -p "/chat-send feishu/dm --file /path/a.pdf 'hello'"
+```
+
+Success is printed to stdout (`message_id: ...`). Errors go to stderr as `chat-send failed: ...`. Pi still exits 0 after a slash-command error, so check stderr rather than the exit code. A fake App Secret fails at tenant-token authentication and does not open a socket.
+
 ## Chat slash commands
 
 Chat users can run a subset of pi slash commands in the connected worker. Set `access.allowedUserIds` to the people who may change the session. When that list is empty, only read-only commands are accepted: `/help`, `/status`, `/session`, `/changelog`, and `/hotkeys`.

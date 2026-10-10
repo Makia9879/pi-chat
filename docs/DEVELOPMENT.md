@@ -18,7 +18,7 @@
 | 自定义工作目录 | 全局、账号、频道三级 `runtime.workspaceDir`，逐字段继承 |
 | 无消息平台会话 | `--chat-local`，可配合 `--chat-workspace /workspace` |
 | 检查 | `npm run check` 与 `npm test` 在补丁后复跑通过；提交前再跑 `git diff --check` |
-| 自动化测试 | 40 个测试通过，入口为 `tests/*.test.ts`。不连接真实飞书、模型供应商或 pi 斜杠运行时 |
+| 自动化测试 | 46 个测试通过，入口为 `tests/*.test.ts`。不连接真实飞书、模型供应商或 pi 斜杠运行时 |
 | 真实模型测试 | `openai/gpt-6-luna:low` 已启动、调用本地 bash 并正常回复，退出码 0 |
 | 本地安装 | 已执行 `pi install /workspace/pi-chat`，`pi list` 可见源码目录 |
 | Git | 改动位于工作树；本轮未执行 git push |
@@ -85,6 +85,7 @@ Discord Gateway / Telegram polling / Feishu HTTP callbacks or WebSocket
 | `src/live/telegram.ts` | long polling、offset、媒体组、发送、附件 |
 | `src/live/feishu.ts` | HTTP callback、安全验证、消息转换、去重、回复和上传；WebSocket 会话交给看门狗 |
 | `src/live/feishu-ws.ts` | 长连接健康看门狗、活动时间、指数退避和状态文本 |
+| `src/chat-send.ts` | 不连接、不加频道锁的本地推送；飞书/Discord/Telegram REST |
 | `src/live/common.ts` | 附件读写、MIME 和 mention 辅助函数 |
 | `src/services/*` | 设置阶段的身份验证和 discovery；飞书文件同时提供 REST client |
 | `src/tui/*` | `/chat-config` 和 guided setup |
@@ -364,6 +365,16 @@ HTTP 回调继续用自有 `decodeFeishuEvent()`，不改走 SDK dispatcher：SD
 
 控制台必须把订阅方式设成「使用长连接接收事件」，并订阅 `im.message.receive_v1`，然后发布版本。不要同时配置请求地址 URL。出站仍要能访问 `open.feishu.cn` 或 `open.larksuite.com`。
 
+#### 本地推送（`/chat-send` / `chat_send`）
+
+这不是频道 worker。调用方可以是另一个本地 pi 会话，甚至 `pi -p "/chat-send ..."`。它只读配置、校验 `account/channel` 存在，然后直接打平台 REST：
+
+- 飞书：`tenant_access_token`，文本走 `im/v1/messages`，文件先 `im/v1/files` 再发 `file`，图片先 `im/v1/images` 再发 `image`。不创建 `WSClient`，不加 conversation `.lock`。
+- Discord / Telegram：同样只发 REST。错误文本会删掉 bot token 和 App Secret。
+- 成功时 stdout / 工具结果打印每个 `message_id`。失败抛出 `chat-send failed: ...`。
+- 日志：发送成功后，在 `${logPath}.append.lock` 下读取最大 `recordId` 再追加 `outbound`（`jobId: "chat-send"`）。这把锁不是 worker 的频道锁。worker 的 `appendConversationRecord()` 也走同一把锁，避免两行 JSONL 交错或复用 id。锁在超时内拿不到时，发送结果仍然返回，并标明 `logged: no`。
+- 聊天里的 `/chat-send` 被当成 `/chat-*` 管理命令拒绝转发。远程 turn 的工具白名单也不包含 `chat_send`。
+
 ##### SDK 静默断线（`@larksuiteoapi/node-sdk` 1.74.0）
 
 现象：worker 进程还在，但从某一时刻起收不到任何事件，stderr 也没有错误。这和 SDK 的默认状态机一致，不是进程崩溃。
@@ -499,6 +510,7 @@ Gondolin HTTP-hook secrets 的 host 限制不能在本地复现，所以 local s
 | `src/secrets.ts` | 修改 | secret name 限制为简单文件名；请求绑定 conversation；写入 0600/目录 0700 |
 | `src/live/feishu.ts` | 新增 | HTTP callback server；WebSocket 使用官方 `WSClient` + `EventDispatcher`；AES/token/signature、nonce、转换/去重、回复/上传、断开。看门狗接入后不再把长连接终端错误转成 `onDisconnect` |
 | `src/live/feishu-ws.ts` | 新增 | 长连接活动时间、过期检测、销毁重建、指数退避和 `/status` 文本 |
+| `src/chat-send.ts` | 新增 | 本地 `/chat-send` 与 `chat_send`：REST 推送，不加频道锁，追加 outbound |
 | `src/live/index.ts` | 修改 | 显式 Telegram/Discord/Feishu 路由和未知 service 错误 |
 | `src/render/format.ts` | 修改 | Feishu plain-text 分支，避免误用 Discord mention 格式化 |
 | `src/services/feishu.ts` | 新增 | tenant REST client、identity、Feishu discovery provider |

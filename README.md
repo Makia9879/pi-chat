@@ -108,6 +108,7 @@ See [configuration examples](docs/configuration.md) for a complete JSON example 
 | `/chat-open-all` | Open running workers in a tiled tmux dashboard |
 | `/chat-kill-all` | Kill all managed tmux/pi workers |
 | `/chat-new` | Start a new pi session, keeping the chat connection |
+| `/chat-send <account/channel> [--file path]... [--image path]... [text]` | Push text, files, or images to a configured channel without connecting or locking it |
 
 Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/worker-status/`. The `chat_workers` tool exposes the same status to an orchestrating pi agent.
 
@@ -286,6 +287,16 @@ The encrypted blob is useless without the ephemeral private key held in pi-chat'
 | `chat_history` | Search older messages from the chat log |
 | `chat_attach` | Queue files to send with the next reply |
 | `chat_request_secret` | Request a secret from the user via encrypted exchange |
+| `chat_send` | Push text, files, or images to a configured channel without connecting |
+
+`/chat-send` and `chat_send` talk to the platform REST API from the current pi process. They do not open a Feishu websocket and do not take the channel lock, so they can be used from a local session while a worker is running. Print mode works without an interactive UI:
+
+```bash
+pi --no-extensions -e /path/to/pi-chat/index.ts --no-session \
+  -p "/chat-send feishu/dm --file /tmp/a.pdf 'hello'"
+```
+
+Stdout prints `message_id:` lines. A bad token fails on stderr and is not sent.
 
 ---
 
@@ -297,7 +308,7 @@ npm run check   # Biome + TypeScript, including tests
 npm test        # Node test runner via tsx; no real chat credentials or QEMU needed
 ```
 
-Tests cover runtime config inheritance, legacy trigger/job behavior, local filesystem and bash operations, cancellation/shutdown, and mocked Feishu authentication, HTTP callback, WebSocket dispatcher, and send flows. They do not open a real Feishu WebSocket. Real app permissions, subscription mode, and delivery should be verified manually.
+Tests cover runtime config inheritance, legacy trigger/job behavior, local filesystem and bash operations, cancellation/shutdown, mocked Feishu authentication, HTTP callback, WebSocket dispatcher, reconnect, and `chat-send` REST delivery. They do not open a real Feishu WebSocket or send a real chat message. Real app permissions, subscription mode, and delivery should be verified manually.
 
 ## Credits
 
