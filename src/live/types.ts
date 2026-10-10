@@ -37,4 +37,13 @@ export interface LiveConnection {
 	 * Abort/cancel only deletes. Success adds nothing.
 	 */
 	markOutcome?(messageId: string | undefined, outcome: LiveProcessingOutcome): Promise<void>;
+	/** Feishu post/markdown reply. Other services omit this and use sendImmediate. */
+	sendRich?(markdown: string, replyToMessageId?: string): Promise<string | undefined>;
+	/** Feishu interactive card with numbered buttons. Falls back to text if the card API rejects it. */
+	sendChoiceCard?(
+		title: string,
+		markdown: string,
+		buttons: Array<{ label: string; value: string }>,
+		replyToMessageId?: string,
+	): Promise<string | undefined>;
 }

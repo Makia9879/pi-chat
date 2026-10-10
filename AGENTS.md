@@ -109,7 +109,7 @@ Discord/Telegram/Feishu ←→ Live Adapter ←→ Runtime (log, jobs, slices) �
 
 ## Remote control commands
 
-Parsed by `ConversationRuntime.parseControlCommand()`: `stop`, `new`, `compact`, `status`, `model`. Handled before normal ingest in the `onMessage` path. `/model` lists authenticated registry models or switches the current pi session model.
+Parsed before normal ingest. Built-in chat commands include `stop`, `new`, `compact`, `status`, `model`, plus slash commands in `src/slash-dispatch.ts`. Extension commands come from `pi.getCommands()` and are not forwarded when they are pi-chat admin commands (`/chat-kill-all`, `/chat-config`, and the other `/chat-*` management commands).
 
 ## Secret exchange flow
 

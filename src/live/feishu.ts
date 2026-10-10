@@ -4,6 +4,7 @@ import { Domain, EventDispatcher, LoggerLevel, WSClient } from "@larksuiteoapi/n
 import { resolveFeishuEventMode } from "../config.js";
 import type { FeishuAccountConfig, FeishuReactionSettings, ResolvedConversation } from "../core/config-types.js";
 import type { InboundMessageInput } from "../core/runtime-types.js";
+import { consumeCardActionToken, feishuCardSelection, feishuChoiceCard, feishuPostBody } from "../feishu-cards.js";
 import { readConversationLog } from "../log.js";
 import { chunkText } from "../render/chunking.js";
 import { formatMarkdownForService } from "../render/format.js";
@@ -358,10 +359,10 @@ function rememberMessage(seen: Set<string>, messageId: string): void {
 function createFeishuOutbound(
 	api: FeishuClient,
 	conversation: ResolvedConversation,
-): Pick<LiveConnection, "send" | "sendImmediate"> {
+): Pick<LiveConnection, "send" | "sendImmediate" | "sendRich" | "sendChoiceCard"> {
 	const postMessage = async (
 		type: string,
-		content: Record<string, string>,
+		content: Record<string, unknown>,
 		replyTo: string | undefined,
 		signal?: AbortSignal,
 	) => {
@@ -410,6 +411,20 @@ function createFeishuOutbound(
 	return {
 		send,
 		sendImmediate: (text, replyTo) => send(text, [], undefined, replyTo),
+		sendRich: async (markdown, replyTo) => {
+			try {
+				return await postMessage("post", feishuPostBody(markdown), replyTo);
+			} catch {
+				return send(markdown, [], undefined, replyTo);
+			}
+		},
+		sendChoiceCard: async (title, markdown, buttons, replyTo) => {
+			try {
+				return await postMessage("interactive", feishuChoiceCard(title, markdown, buttons), replyTo);
+			} catch {
+				return send(markdown, [], undefined, replyTo);
+			}
+		},
 	};
 }
 
@@ -568,6 +583,20 @@ export async function connectFeishuLive(
 		queue = task.catch(report);
 		await task;
 	};
+	const cardTokens = new Map<string, number>();
+	const emitCardAction = async (data: Parameters<typeof feishuCardSelection>[0]) => {
+		const selection = feishuCardSelection(data);
+		if (!selection || !consumeCardActionToken(cardTokens, selection.token)) return;
+		await handlers.onMessage(
+			{
+				userId: selection.userId,
+				text: `/pi-select ${selection.index}`,
+				messageId: selection.token ? `card:${selection.token}` : undefined,
+				mentionedBot: true,
+			},
+			selection.token ? { messageId: `card:${selection.token}` } : undefined,
+		);
+	};
 
 	if (eventMode === "websocket") {
 		const factory = options?.wsSessionFactory ?? createDefaultFeishuWsSession;
@@ -584,6 +613,11 @@ export async function connectFeishuLive(
 			const event = feishuEventFromSdkData(data);
 			event.header = { ...event.header, event_type: event.header?.event_type ?? "im.message.receive_v1" };
 			await ingest(event);
+		});
+		dispatcher.register({
+			"card.action.trigger": async (data: Parameters<typeof feishuCardSelection>[0]) => {
+				await emitCardAction(data);
+			},
 		});
 		// No historical catch-up API is used. Only newly delivered events trigger jobs.
 		await handlers.onCaughtUp();
@@ -642,6 +676,11 @@ export async function connectFeishuLive(
 			}
 			if (event.type === "url_verification" && typeof event.challenge === "string") {
 				res.writeHead(200, { "content-type": "application/json" }).end(JSON.stringify({ challenge: event.challenge }));
+				return;
+			}
+			if (feishuCardSelection(event as Parameters<typeof feishuCardSelection>[0])) {
+				await emitCardAction(event as Parameters<typeof feishuCardSelection>[0]);
+				res.writeHead(200, { "content-type": "application/json" }).end("{}");
 				return;
 			}
 			// Serialize ingestion and acknowledge after it is logged, not after the model reply.

@@ -1,8 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { type Dirent, constants as fsConstants, mkdirSync } from "node:fs";
-import { lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
-import { basename, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { copyFile, lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { createRequire } from "node:module";
+import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
 	createBashTool,
@@ -36,6 +37,8 @@ import type { LiveConnection } from "./src/live/types.js";
 import { formatModelList, formatModelSwitch, resolveChatModel } from "./src/model-command.js";
 import { ConversationRuntime } from "./src/runtime.js";
 import { clearPendingSecrets, createSecretRequest, tryDecryptSecret, writeRuntimeSecret } from "./src/secrets.js";
+import { formatChangelogExcerpt } from "./src/slash-commands.js";
+import { dispatchSlash, type SlashChoice } from "./src/slash-dispatch.js";
 import { runChatConfigUI } from "./src/tui/chat-config.js";
 import { runWithLoader, selectItem, showNotice } from "./src/tui/dialogs.js";
 
@@ -470,6 +473,8 @@ export default function (pi: ExtensionAPI) {
 
 	let runtime: ConversationRuntime | undefined;
 	let liveConnection: LiveConnection | undefined;
+	const slashChoices = new Map<string, SlashChoice>();
+	let slashOp: { resolve: (text: string) => void } | undefined;
 	let sandbox: ConversationExecution | undefined;
 	let executionError: string | undefined;
 	let executionRequired = false;
@@ -660,6 +665,89 @@ export default function (pi: ExtensionAPI) {
 		return scoped.length > 0 ? scoped : undefined;
 	}
 
+	function flattenSessionTree(
+		nodes: Array<{ entry: { id: string; type: string }; children?: unknown[]; label?: string }>,
+		depth = 0,
+	): Array<{ id: string; label: string }> {
+		const lines: Array<{ id: string; label: string }> = [];
+		for (const node of nodes) {
+			lines.push({
+				id: node.entry.id,
+				label: `${"  ".repeat(depth)}${node.entry.type}${node.label ? ` ${node.label}` : ""}`,
+			});
+			lines.push(...flattenSessionTree((node.children as typeof nodes) ?? [], depth + 1));
+		}
+		return lines;
+	}
+
+	function slashChoiceKey(userId: string): string {
+		return `${runtime?.conversation.conversationId ?? "chat"}\0${userId}`;
+	}
+
+	async function replySlash(text: string, replyTo?: string): Promise<void> {
+		if (liveConnection?.sendRich) await liveConnection.sendRich(text, replyTo);
+		else await liveConnection?.sendImmediate(text, replyTo);
+	}
+
+	async function chooseSlash(
+		title: string,
+		markdown: string,
+		buttons: Array<{ label: string; value: string }>,
+		replyTo?: string,
+	) {
+		if (liveConnection?.sendChoiceCard) {
+			await liveConnection.sendChoiceCard(title, markdown, buttons, replyTo);
+			return;
+		}
+		await replySlash(markdown, replyTo);
+	}
+
+	function readChangelogExcerpt(): string {
+		const require = createRequire(import.meta.url);
+		for (const name of ["@earendil-works/pi-coding-agent/package.json", "@mariozechner/pi-coding-agent/package.json"]) {
+			try {
+				const file = join(dirname(require.resolve(name)), "CHANGELOG.md");
+				return formatChangelogExcerpt(require("node:fs").readFileSync(file, "utf8"));
+			} catch {
+				// try the next package name
+			}
+		}
+		return "pi 的 /changelog 由 TUI 渲染，扩展 API 没有等价接口。请在 pi 安装目录查看 CHANGELOG.md。";
+	}
+
+	function sendExpandedUserMessage(
+		api: ExtensionAPI,
+		text: string,
+		options?: { deliverAs?: "steer" | "followUp" },
+	): Promise<void> {
+		const send = api.sendUserMessage as (
+			content: string,
+			options?: { deliverAs?: "steer" | "followUp"; expandPromptTemplates?: boolean },
+		) => Promise<void> | void;
+		return Promise.resolve(send(text, { ...options, expandPromptTemplates: true }));
+	}
+
+	async function runSlashSessionOp(action: string, id?: string): Promise<string> {
+		const payload = Buffer.from(JSON.stringify({ action, id })).toString("base64url");
+		return await new Promise((resolve, reject) => {
+			const timer = setTimeout(() => {
+				slashOp = undefined;
+				reject(new Error("会话命令超时"));
+			}, 20000);
+			slashOp = {
+				resolve: (text) => {
+					clearTimeout(timer);
+					resolve(text);
+				},
+			};
+			void sendExpandedUserMessage(pi, `/chat-op ${payload}`, { deliverAs: "followUp" }).catch((error: unknown) => {
+				clearTimeout(timer);
+				slashOp = undefined;
+				reject(error instanceof Error ? error : new Error(String(error)));
+			});
+		});
+	}
+
 	function buildRemoteStatus(ctx: ExtensionContext): string {
 		let totalInput = 0;
 		let totalOutput = 0;
@@ -786,55 +874,112 @@ export default function (pi: ExtensionAPI) {
 							await tryDispatch(ctx);
 							return;
 						}
-						const control = runtime.isArmed() ? runtime.parseControlCommand(input) : undefined;
-						if (control && checkpoint) await runtime.noteCheckpoint(checkpoint);
-						if (control?.name === "stop") {
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								ctx.abort();
-								await liveConnection?.sendImmediate("Aborted current turn.");
-							} else {
-								await liveConnection?.sendImmediate("No active turn.");
-							}
-							return;
-						}
-						if (control?.name === "compact") {
-							const runCompact = async () => {
-								ctx.compact({
-									onComplete: () => void liveConnection?.sendImmediate("Compaction completed."),
-									onError: (error) => void liveConnection?.sendImmediate(`Compaction failed: ${error.message}`),
-								});
-								await liveConnection?.sendImmediate("Compaction started.");
-							};
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								pendingControlAction = runCompact;
-								ctx.abort();
-								await liveConnection?.sendImmediate("Aborting current turn, then compacting.");
+						if (runtime.isArmed()) {
+							const account = runtime.conversation.account;
+							const handled = await dispatchSlash(
+								{
+									text: input.text,
+									userId: input.userId,
+									allowedUserIds: runtime.conversation.access.allowedUserIds,
+									botUserId: "botUserId" in account ? account.botUserId : undefined,
+									botNames: [runtime.conversation.botName, "botUsername" in account ? account.botUsername : undefined],
+									pending: slashChoices.get(slashChoiceKey(input.userId)),
+									commands: pi.getCommands().map((command) => ({
+										name: command.name,
+										description: command.description,
+										source: command.source,
+									})),
+									skills: pi
+										.getCommands()
+										.filter((command) => command.source === "skill")
+										.map((command) => ({
+											name: command.name.replace(/^skill:/, ""),
+											description: command.description,
+										})),
+								},
+								{
+									reply: (text) => replySlash(text, checkpoint?.messageId),
+									choose: (title, markdown, buttons) => chooseSlash(title, markdown, buttons, checkpoint?.messageId),
+									attach: async (path, caption) => {
+										await liveConnection?.send(caption, [path], undefined, checkpoint?.messageId);
+									},
+									describeModel: (pattern) => describeModelCommand(ctx, pattern),
+									thinkingLevel: () => pi.getThinkingLevel(),
+									setThinkingLevel: (level) =>
+										pi.setThinkingLevel(level as Parameters<ExtensionAPI["setThinkingLevel"]>[0]),
+									compact: (instructions) => {
+										ctx.compact({
+											customInstructions: instructions,
+											onComplete: () => void replySlash("压缩完成。"),
+											onError: (error) => void replySlash(`压缩失败：${error.message}`),
+										});
+									},
+									statusText: () => buildRemoteStatus(ctx),
+									sessionName: () => pi.getSessionName(),
+									setSessionName: (name) => pi.setSessionName(name),
+									sessionOp: async (action, id) => {
+										if (action === "stop") {
+											if (chatTurnInFlight || !ctx.isIdle()) {
+												ctx.abort();
+												return "已中止当前 turn。";
+											}
+											return "没有正在进行的 turn。";
+										}
+										if (action === "new") {
+											await sendExpandedUserMessage(pi, "/chat-new", {
+												deliverAs: chatTurnInFlight ? "followUp" : undefined,
+											});
+											return "正在开始新的 pi 会话，聊天连接保持。";
+										}
+										return runSlashSessionOp(action, id);
+									},
+									expandPrompt: (text) =>
+										sendExpandedUserMessage(pi, text, {
+											deliverAs: chatTurnInFlight ? "followUp" : undefined,
+										}),
+									listSessions: async () => {
+										const sessions = await SessionManager.list(ctx.cwd);
+										return sessions
+											.sort((a, b) => b.modified.getTime() - a.modified.getTime())
+											.slice(0, 10)
+											.map((session) => ({
+												path: session.path,
+												label: `${session.name || session.id} · ${session.modified.toISOString().slice(0, 16)} · ${session.messageCount} msgs`,
+											}));
+									},
+									listForks: () =>
+										ctx.sessionManager
+											.getBranch()
+											.flatMap((entry) => {
+												if (entry.type !== "message") return [];
+												const message = entry.message as { role?: string; content?: unknown };
+												if (message.role !== "user") return [];
+												const text =
+													typeof message.content === "string" ? message.content : JSON.stringify(message.content ?? "");
+												return [{ id: entry.id, label: text.slice(0, 80) || entry.id }];
+											})
+											.slice(-15),
+									listTree: () => flattenSessionTree(ctx.sessionManager.getTree()).slice(0, 20),
+									exportPath: async () => {
+										const source = ctx.sessionManager.getSessionFile();
+										if (!source || !runtime) return undefined;
+										const target = join(
+											runtime.conversation.workspaceDir,
+											`session-${ctx.sessionManager.getSessionId()}.jsonl`,
+										);
+										await mkdir(runtime.conversation.workspaceDir, { recursive: true });
+										await copyFile(source, target);
+										return target;
+									},
+									changelog: readChangelogExcerpt,
+									saveChoice: (choice) => slashChoices.set(slashChoiceKey(input.userId), choice),
+									clearChoice: () => slashChoices.delete(slashChoiceKey(input.userId)),
+								},
+							);
+							if (handled) {
+								if (checkpoint) await runtime.noteCheckpoint(checkpoint);
 								return;
 							}
-							await runCompact();
-							return;
-						}
-						if (control?.name === "status") {
-							await liveConnection?.sendImmediate(buildRemoteStatus(ctx));
-							return;
-						}
-						if (control?.name === "model") {
-							await liveConnection?.sendImmediate(await describeModelCommand(ctx, control.pattern));
-							return;
-						}
-						if (control?.name === "new") {
-							const queueNewSession = async () => {
-								pi.sendUserMessage("/chat-new", { deliverAs: "followUp" });
-								await liveConnection?.sendImmediate("Starting a new pi session.");
-							};
-							if (chatTurnInFlight || !ctx.isIdle()) {
-								pendingControlAction = queueNewSession;
-								ctx.abort();
-								await liveConnection?.sendImmediate("Aborting current turn, then starting a new pi session.");
-								return;
-							}
-							await queueNewSession();
-							return;
 						}
 						await runtime.ingestInbound(input, checkpoint);
 						await tryDispatch(ctx);
@@ -1381,6 +1526,55 @@ export default function (pi: ExtensionAPI) {
 				if (!spec) return;
 			}
 			await connectConversation(ctx, spec, true);
+		},
+	});
+
+	pi.registerCommand("chat-op", {
+		description: "Internal pi-chat session operation. Not for chat users.",
+		handler: async (args, cmdCtx) => {
+			const finish = (text: string) => {
+				slashOp?.resolve(text);
+				slashOp = undefined;
+			};
+			try {
+				const op = JSON.parse(Buffer.from(args.trim(), "base64url").toString("utf8")) as {
+					action?: string;
+					id?: string;
+				};
+				if (op.action === "resume" && op.id) {
+					const result = await cmdCtx.switchSession(op.id);
+					finish(result.cancelled ? "切换会话已取消。" : "已切换会话。");
+					return;
+				}
+				if (op.action === "fork" && op.id) {
+					const result = await cmdCtx.fork(op.id);
+					finish(result.cancelled ? "分叉已取消。" : "已从所选消息分叉。");
+					return;
+				}
+				if (op.action === "tree" && op.id) {
+					const result = await cmdCtx.navigateTree(op.id);
+					finish(result.cancelled ? "跳转已取消。" : "已跳到所选树节点。");
+					return;
+				}
+				if (op.action === "clone") {
+					const leaf = cmdCtx.sessionManager.getLeafId();
+					if (!leaf) {
+						finish("没有可克隆的位置。");
+						return;
+					}
+					const result = await cmdCtx.fork(leaf);
+					finish(result.cancelled ? "克隆已取消。" : "已克隆当前会话。扩展 API 没有单独的 clone，使用 fork(leaf)。");
+					return;
+				}
+				if (op.action === "reload") {
+					finish("正在重载扩展、skills 和提示词。聊天连接可能断开。");
+					await cmdCtx.reload();
+					return;
+				}
+				finish("未知会话操作。");
+			} catch (error) {
+				finish(error instanceof Error ? error.message : String(error));
+			}
 		},
 	});
 

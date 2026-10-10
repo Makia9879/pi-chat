@@ -112,6 +112,14 @@ FEISHU_REACTIONS=false
 
 `0`, `no`, and `off` also disable. Any other value, including an unset variable, leaves the account setting in effect. Reaction API errors are logged and do not fail the reply. Publish `im:message.reactions:write_only` with the app version or the add call is rejected and ignored.
 
+## Chat slash commands
+
+Chat users can run a subset of pi slash commands in the connected worker. Set `access.allowedUserIds` to the people who may change the session. When that list is empty, only read-only commands are accepted: `/help`, `/status`, `/session`, `/changelog`, and `/hotkeys`.
+
+`/help` lists the chat commands, skills, prompt templates, and slash commands registered by other installed pi extensions. Commands implemented by pi-chat itself for host management (`/chat-config`, `/chat-kill-all`, `/chat-spawn-all`, `/chat-disconnect`, and the other `/chat-*` admin commands) are not forwarded.
+
+Feishu selection uses a numbered list plus an interactive card, following Hermes `plugins/platforms/feishu/adapter.py` (`_card`, `_card_button`, 15-minute card-token dedup). Discord and Telegram get the same numbered text. Long-connection mode may not deliver card callbacks; reply with the number in that case.
+
 ## Runtime inheritance
 
 The same `runtime` object is accepted at the root, account, and channel levels. Each property uses the most specific defined value. For example:

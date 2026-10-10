@@ -117,14 +117,24 @@ Workers also write status snapshots every 15 seconds under `~/.pi/agent/chat/wor
 
 Users in the connected chat can send these commands (with or without a leading `/`, and with or without mentioning the bot). `/model` only lists providers that already have credentials. An unknown pattern returns nearby suggestions instead of switching. The change applies to this pi session, not the global default; a turn already in flight finishes on the previous model.
 
+Slash commands run in the worker's pi session. If `access.allowedUserIds` is set, only those users can run them. If it is empty, only read-only commands work: `/help`, `/status`, `/session`, `/changelog`, and `/hotkeys`. `/help` also lists installed extension commands, skills, and prompt templates. Host management commands such as `/chat-config`, `/chat-kill-all`, `/chat-spawn-all`, and `/chat-disconnect` are not forwarded. `/login`, `/logout`, `/quit`, `/settings`, `/scoped-models`, `/trust`, `/share`, `/copy`, `/import`, `/bug`, and `/llama` are rejected with a reason.
+
 | Command | Effect |
 |---------|--------|
 | `stop` | Abort the current turn |
 | `status` | Show model, usage, context stats |
 | `model` | List the current model and authenticated models |
 | `model <pattern>` | Switch this worker's session model. Examples: `grok-4.7`, `xai/grok-4.7:high` |
-| `compact` | Trigger context compaction |
+| `thinking [level]` | Show or set the thinking level |
+| `compact [note]` | Compact context, optionally with instructions |
 | `new` | Start a new pi session |
+| `name [text]` | Show or set the session name |
+| `session` | Session info plus the status/cost summary |
+| `resume` / `fork` / `tree` | Numbered picker (Feishu also sends a button card) |
+| `clone` / `reload` | Confirm with `1`/`2` or a card button |
+| `export` | Send the session JSONL back as an attachment |
+| `skill:<name> [args]` | Expand a skill and send it as the next prompt |
+| `help` | List chat, builtin, skill, template, and extension commands |
 
 ---
 

@@ -18,7 +18,7 @@
 | 自定义工作目录 | 全局、账号、频道三级 `runtime.workspaceDir`，逐字段继承 |
 | 无消息平台会话 | `--chat-local`，可配合 `--chat-workspace /workspace` |
 | 检查 | `npm run check` 与 `npm test` 在补丁后复跑通过；提交前再跑 `git diff --check` |
-| 自动化测试 | 27 个测试通过，入口为 `tests/*.test.ts`。WebSocket、表情和 `/model` 用例不连接真实飞书或模型供应商 |
+| 自动化测试 | 32 个测试通过，入口为 `tests/*.test.ts`。不连接真实飞书、模型供应商或 pi 斜杠运行时 |
 | 真实模型测试 | `openai/gpt-6-luna:low` 已启动、调用本地 bash 并正常回复，退出码 0 |
 | 本地安装 | 已执行 `pi install /workspace/pi-chat`，`pi list` 可见源码目录 |
 | Git | 改动位于工作树；本轮未执行 git push |
@@ -129,7 +129,7 @@ interface InboundMessageInput {
 处理顺序的重要细节：
 
 1. `index.ts` 的 `onMessage` 首先尝试识别 runtime secret 回包。只有已 arming、通过 access policy，且 request 绑定到当前 conversation 的回包才会写入 `.secrets/`。
-2. runtime 已 arming 后解析 `stop/new/compact/status/model`。`/model` 与不带斜杠的 `model` 同样处理，可带 `provider/id` 和 `:thinking` 后缀。
+2. runtime 已 arming 后解析聊天斜杠命令，包括 `stop/new/compact/status/model` 以及 `/thinking`、`/resume`、`/skill:` 和 `pi.getCommands()` 里的扩展命令。`/model` 与不带斜杠的 `model` 同样处理。
 3. 对控制命令有 checkpoint 时，入口现在会记录 checkpoint，帮助重连去重。
 4. 普通消息进入 `ingestInbound()`：规范化 → 附件 materialize → 写 inbound → checkpoint → trigger 判断 → 必要时写 `job_queued`。
 5. `tryDispatch()` 在 pi 空闲且没有远端 turn 时调用 `beginNextJob()`，通过 `pi.sendUserMessage()` 启动模型。
@@ -155,6 +155,9 @@ interface InboundMessageInput {
 - 发完回复才推进 job 消费边界；发送失败会留下失败记录。
 - `stop` 中止当前 turn；`compact` 可以先 abort 再 compact；`new` 通过 `/chat-new` 建立新 pi session；`status` 报告模型、用量、队列和环境。
 - `/model` 不创建 job。无参数时回复当前模型和 `modelRegistry.getAvailable()` 里已配置认证的模型；带 pattern 时调用 `pi.setModel()`，显式 `:thinking` 再 `setThinkingLevel()`。未知 pattern 只回复错误和相近建议。会话若配置了 `scopedModels`，列表和切换都限制在该范围内。
+- 其他斜杠命令由 `src/slash-dispatch.ts` 分发。可用 API：`setThinkingLevel`、`compact`、`setSessionName`、`sendUserMessage({ expandPromptTemplates: true })`、`getCommands()`、`SessionManager.list`、命令上下文的 `newSession`/`switchSession`/`fork`/`navigateTree`/`reload`。没有单独的 clone API，`/clone` 用 `fork(leaf)`。`/export` 复制会话 JSONL 并作为附件发送；HTML 导出函数没有公开给扩展。`/hotkeys` 和 `/changelog` 不能读 TUI 渲染器，分别返回默认键位说明和 CHANGELOG 摘录（文件不存在时说明原因）。
+- 飞书选择卡片照抄 Hermes `plugins/platforms/feishu/adapter.py` 的 `_card` / `_card_button`，token 去重 15 分钟（同文件 `_FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS`）。长连接不一定投递卡片回调，因此编号回复始终可用。其他 service 只发编号文本。
+- `allowedUserIds` 非空时，只有名单内用户可执行命令。名单为空时只允许 `/help /status /session /changelog /hotkeys`。`/login /logout /quit /settings /scoped-models /trust /share /copy /import /bug /llama` 以及 `/chat-*` 管理命令直接拒绝。扩展命令通过 `getCommands()` 透传，排除 pi-chat 自己的管理命令。
 - 有远端 turn 时，`tool_call` 只允许 `read/write/edit/bash/chat_history/chat_attach/chat_request_secret`。独立本地模式没有远端 turn，不把这项限制当作宿主机安全边界。
 
 ## 3. 存储、工作目录与路径约定
@@ -794,7 +797,7 @@ git diff --check
 npm run format
 ```
 
-本轮 `npm run check` 无错误，`npm test` 为 27 passed、0 failed。WebSocket、表情和 `/model` 用例没有连接真实飞书或模型供应商。`git diff --check` 需在改动后重跑。
+本轮 `npm run check` 无错误，`npm test` 为 32 passed、0 failed。斜杠命令测试不启动真实 pi 会话。`git diff --check` 需在改动后重跑。
 
 ### 9.2 测试覆盖范围
 
@@ -803,6 +806,7 @@ npm run format
 | `tests/feishu.test.ts` | 13 | token/AES/signature/expiry/app ID/nonce；消息过滤/身份/控制 mention；rich-text；Lark token cache/refresh；本地 HTTP callback、去重、分片、文件发送、query string、超限 body、端口冲突、签名重放、reply fallback、GET 单次重试；WebSocket `EventDispatcher` 去重/app 过滤/不占端口；非法 App ID 不发网络请求，缺省 eventMode 仍要求 HTTP token；Typing/CrossMark 生命周期、`reactions` 与 `FEISHU_REACTIONS` 开关、表情 API 失败不影响连接 |
 | `tests/local.test.ts` | 3 | native read/write/edit/bash/cwd/staging；最小 env、timeout、已 abort/运行中 abort、close；拒绝 Gondolin secrets 且失败后工具不可用 |
 | `tests/model-command.test.ts` | 3 | `/model` 列表、`provider/id` 与 `:thinking` 匹配、未知 pattern 建议、非法 thinking level |
+| `tests/slash-commands.test.ts` | 5 | 斜杠解析、空白名单只读策略、`/help` 列出扩展命令并隐藏 chat 管理命令、飞书卡片/去重、禁止命令不执行 |
 | `tests/runtime.test.ts` | 7 | 配置默认值/继承/验证；旧/新 pi prompt cwd；worker 冲突、WebSocket 不占端口、未知 eventMode；配置文件权限；catch-up/access/失败消费边界；DM/VM display path 回归；缺省 eventMode 为 HTTP；`/model` 控制命令解析 |
 | `tests/secrets.test.ts` | 1 | secret 名称、conversation 绑定、清理，以及 secret 文件/目录权限修复 |
 
