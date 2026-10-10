@@ -32,6 +32,12 @@ import {
 import type { ResolvedConversation } from "./src/core/config-types.js";
 import { type ConversationExecution, createConversationExecution, displayPath } from "./src/execution.js";
 import { executionSystemPrompt } from "./src/execution-prompt.js";
+import {
+	type FeishuWorkerStatusFields,
+	feishuWorkerStatusFields,
+	formatFeishuConnectionStatus,
+	formatFeishuWorkerSuffix,
+} from "./src/live/feishu-ws.js";
 import { connectLive } from "./src/live/index.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { formatModelList, formatModelSwitch, resolveChatModel } from "./src/model-command.js";
@@ -137,6 +143,7 @@ interface WorkerStatusSnapshot {
 	recordCount: number;
 	lastRecordId: number;
 	lastError?: string;
+	feishuWs?: FeishuWorkerStatusFields;
 }
 
 interface ChatPromptSkill {
@@ -347,8 +354,9 @@ async function formatWorkerStatus(conversations: ResolvedConversation[]): Promis
 		const state = snapshot?.lastError ? `error: ${snapshot.lastError}` : (snapshot?.state ?? "unknown");
 		const queue = snapshot ? `q:${snapshot.queueLength}${snapshot.chatTurnInFlight ? " active" : ""}` : "q:?";
 		const model = snapshot?.model ? ` ${snapshot.model}` : "";
+		const ws = formatFeishuWorkerSuffix(snapshot?.feishuWs);
 		lines.push(
-			`${running ? "●" : "○"} ${conversation.conversationName} — ${state}, ${queue}, ${formatStatusAge(snapshot?.updatedAt)}${model}\n  ${tmuxName}`,
+			`${running ? "●" : "○"} ${conversation.conversationName} — ${state}, ${queue}, ${formatStatusAge(snapshot?.updatedAt)}${ws}${model}\n  ${tmuxName}`,
 		);
 	}
 	return lines.join("\n");
@@ -793,6 +801,8 @@ export default function (pi: ExtensionAPI) {
 			lines.push(`Runtime: ${runtime.conversation.runtimeMode}; workspace: ${runtime.conversation.workspacePath}`);
 			lines.push(`Queue: ${status.queueLength}${status.hasActiveJob ? " (active)" : ""}`);
 		}
+		const link = liveConnection?.connectionStatus?.();
+		if (link) lines.push(formatFeishuConnectionStatus(link));
 		if (!runtime && sandbox) lines.push(`Runtime: ${sandbox.mode}; workspace: ${sandbox.workspacePath}`);
 		return lines.join("\n") || "No usage data yet.";
 	}
@@ -991,6 +1001,10 @@ export default function (pi: ExtensionAPI) {
 						if (runtime) await runtime.appendError(error.message);
 						updateStatus(ctx, error.message);
 					},
+					onConnectionEvent: async (event) => {
+						if (runtime) await runtime.appendError(`feishu-ws ${event.type}: ${event.message}`);
+						updateStatus(ctx);
+					},
 					onDisconnect: async () => {
 						if (!runtime) return;
 						const cid = runtime.conversation.conversationId;
@@ -1083,6 +1097,8 @@ export default function (pi: ExtensionAPI) {
 			lastRecordId: status.lastRecordId,
 			lastError: error,
 		};
+		const link = liveConnection?.connectionStatus?.();
+		if (link) snapshot.feishuWs = feishuWorkerStatusFields(link);
 		await mkdir(WORKER_STATUS_DIR, { recursive: true });
 		await writeFile(workerStatusPath(status.conversationId), `${JSON.stringify(snapshot, null, "\t")}\n`, "utf8");
 	}
@@ -1120,6 +1136,8 @@ export default function (pi: ExtensionAPI) {
 		const details = [status.conversationName];
 		if (status.hasActiveJob) details.push("active");
 		if (status.queueLength > 0) details.push(`q:${status.queueLength}`);
+		const link = liveConnection?.connectionStatus?.();
+		if (link && link.state !== "connected") details.push(`ws:${link.state}`);
 		ctx.ui.setStatus("chat", `${label} ${theme.fg("success", details.join(" | "))}`);
 	}
 

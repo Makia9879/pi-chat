@@ -71,11 +71,28 @@ export interface FeishuReactionSettings {
 	failure?: string;
 }
 
+/** Optional long-connection health thresholds. Omitted fields use the defaults in `resolveFeishuWsHealth`. */
+export interface FeishuWebSocketHealthConfig {
+	/** How often to compare last inbound activity with `staleTimeoutMs`. Default 15000. */
+	healthCheckIntervalMs?: number;
+	/**
+	 * No inbound frame, pong, or event for this long means the socket is dead.
+	 * Default 300000. Must exceed the platform ping interval (SDK default 120s) or a healthy idle link is rebuilt.
+	 */
+	staleTimeoutMs?: number;
+	/** First reconnect delay. Later attempts double until `reconnectMaxDelayMs`. Default 1000. */
+	reconnectMinDelayMs?: number;
+	/** Cap for exponential reconnect backoff, including jitter. Default 60000. */
+	reconnectMaxDelayMs?: number;
+}
+
 export interface FeishuAccountConfig extends BaseAccountConfig {
 	service: "feishu";
 	appId: string;
 	appSecret: string;
 	domain?: "feishu" | "lark";
+	/** WebSocket liveness and reconnect backoff. Ignored in HTTP callback mode. */
+	websocket?: FeishuWebSocketHealthConfig;
 	/**
 	 * Status reactions on the triggering message. Default enabled.
 	 * `false` or `{ enabled: false }` turns them off for this account.

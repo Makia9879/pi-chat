@@ -1,11 +1,26 @@
 import type { ResolvedConversation } from "../core/config-types.js";
 import type { InboundMessageInput } from "../core/runtime-types.js";
 
+export interface LiveConnectionEvent {
+	type: string;
+	message: string;
+}
+
+export interface LiveConnectionStatus {
+	state: string;
+	lastActivityAt?: string;
+	reconnectCount: number;
+	nextReconnectAt?: string;
+	lastDisconnectReason?: string;
+}
+
 export interface LiveConnectionHandlers {
 	onMessage(input: InboundMessageInput, checkpoint?: { cursor?: string; messageId?: string }): Promise<void>;
 	onCaughtUp(): Promise<void>;
 	onError(error: Error): Promise<void>;
 	onDisconnect?(): Promise<void>;
+	/** Link lifecycle. Feishu uses this for connect, disconnect, and reconnect. */
+	onConnectionEvent?(event: LiveConnectionEvent): Promise<void> | void;
 }
 
 export interface ResumeState {
@@ -19,6 +34,8 @@ export type LiveProcessingOutcome = "success" | "failure" | "cancelled";
 export interface LiveConnection {
 	conversation: ResolvedConversation;
 	disconnect(): Promise<void>;
+	/** Present for Feishu WebSocket. HTTP callbacks and other services omit it. */
+	connectionStatus?(): LiveConnectionStatus;
 	sendImmediate(text: string, replyToMessageId?: string): Promise<string | undefined>;
 	send(
 		text: string,

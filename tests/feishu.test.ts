@@ -369,6 +369,12 @@ test("Feishu WebSocket mode uses EventDispatcher without a token, port, or live 
 	});
 	t.after(() => client.close({ force: true }));
 	assert.ok(client instanceof WSClient);
+	const inspected = client as unknown as {
+		pingTimeoutSec?: number;
+		wsConfig?: { getWS: () => { autoReconnect?: boolean } };
+	};
+	assert.equal(inspected.wsConfig?.getWS().autoReconnect, false);
+	assert.equal(inspected.pingTimeoutSec, 45);
 	const probe = createServer();
 	await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
 	const address = probe.address();
@@ -417,7 +423,7 @@ test("Feishu WebSocket mode uses EventDispatcher without a token, port, or live 
 		{
 			wsSessionFactory: () => ({
 				async start(next) {
-					dispatcher = next;
+					dispatcher = next as EventDispatcher;
 				},
 				close() {
 					closed = true;
@@ -656,4 +662,107 @@ test("Feishu reaction API failures and disable switches do not affect the connec
 	await broken.stopTyping();
 	await broken.markOutcome?.("om_down", "failure");
 	assert.equal(reactionCalls, 1);
+});
+
+test("Feishu websocket health config is rejected before any platform call", async (t) => {
+	const f = await fixture({
+		accounts: {
+			test: {
+				...structuredClone(account),
+				appId: wsAppId,
+				eventMode: "websocket",
+				websocket: { staleTimeoutMs: -1 },
+			},
+		},
+	});
+	t.after(f.cleanup);
+	await assert.rejects(
+		() =>
+			connectFeishuLive(f.conversation, {
+				onCaughtUp: async () => {},
+				onMessage: async () => {},
+				onError: async () => {},
+			}),
+		/staleTimeoutMs/,
+	);
+});
+
+test("Feishu websocket reconnect keeps message dedup and still accepts a new event", async (t) => {
+	const f = await fixture({
+		accounts: { test: { ...structuredClone(account), appId: wsAppId, eventMode: "websocket" } },
+	});
+	t.after(f.cleanup);
+	const original = globalThis.fetch;
+	t.after(() => {
+		globalThis.fetch = original;
+	});
+	globalThis.fetch = async (input) => {
+		const url = String(input);
+		if (url.includes("tenant_access_token")) return Response.json({ code: 0, tenant_access_token: "token" });
+		if (url.endsWith("/bot/v3/info")) return Response.json({ code: 0, bot: { open_id: "ou_bot" } });
+		return Response.json({ code: 0, data: { message_id: "sent" } });
+	};
+	const logs: string[] = [];
+	const events: string[] = [];
+	let hooks: { onLinkDown?: (reason: string) => void } = {};
+	let dispatcher: EventDispatcher | undefined;
+	const received: string[] = [];
+	const live = await connectFeishuLive(
+		f.conversation,
+		{
+			onCaughtUp: async () => {},
+			onMessage: async (input) => {
+				received.push(input.messageId ?? "");
+			},
+			onError: async (error) => {
+				throw error;
+			},
+			onConnectionEvent: async (event) => {
+				events.push(event.type);
+			},
+		},
+		{
+			wsSessionFactory: (_account, next) => {
+				hooks = next;
+				return {
+					async start(nextDispatcher) {
+						dispatcher = nextDispatcher as EventDispatcher;
+					},
+					close() {},
+				};
+			},
+			wsControl: {
+				sleep: async () => {},
+				random: () => 1,
+				schedule: () => ({ stop() {} }),
+				log: (line) => logs.push(line),
+			},
+		},
+	);
+	t.after(() => live.disconnect());
+	assert.equal(live.connectionStatus?.().state, "connected");
+	assert.equal(live.connectionStatus?.().reconnectCount, 0);
+	assert.ok(live.connectionStatus?.().lastActivityAt);
+	const envelope = (id: string) => ({
+		schema: "2.0",
+		header: { event_id: `ev_${id}`, event_type: "im.message.receive_v1", app_id: wsAppId, token: "" },
+		event: event(id).event,
+	});
+	await dispatcher?.invoke(envelope("om_again"), { needCheck: false });
+	await dispatcher?.invoke(envelope("om_again"), { needCheck: false });
+	assert.deepEqual(received, ["om_again"]);
+	hooks.onLinkDown?.("socket close");
+	for (let i = 0; i < 20 && !events.includes("reconnected"); i++) {
+		await new Promise((resolve) => setImmediate(resolve));
+	}
+	assert.ok(events.includes("disconnected"));
+	assert.ok(events.includes("reconnecting"));
+	assert.ok(events.includes("reconnected"));
+	assert.match(logs.join("\n"), /WebSocket disconnected: socket close/);
+	assert.match(logs.join("\n"), /WebSocket reconnected/);
+	assert.equal(live.connectionStatus?.().state, "connected");
+	assert.equal(live.connectionStatus?.().reconnectCount, 1);
+	await dispatcher?.invoke(envelope("om_again"), { needCheck: false });
+	await dispatcher?.invoke(envelope("om_new"), { needCheck: false });
+	assert.deepEqual(received, ["om_again", "om_new"]);
 });

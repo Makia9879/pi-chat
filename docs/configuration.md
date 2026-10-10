@@ -65,7 +65,43 @@ cd /workspace
 pi --model openai/gpt-6-luna:low --chat-conversation feishu-team/general
 ```
 
-Alternatively launch pi and run `/chat-connect feishu-team/general`. WebSocket connect waits for the first SDK handshake (30 seconds) and does not open a local callback port.
+Alternatively launch pi and run `/chat-connect feishu-team/general`. WebSocket connect waits for the first SDK handshake (30 seconds) and does not open a local callback port. After that handshake, a health watchdog keeps the long connection up; see below.
+
+## Feishu WebSocket health and reconnect
+
+Long connection can go quiet without the process exiting. A half-open TCP path often leaves the official SDK socket in `OPEN` and emits neither `close` nor `error`, so the worker stays up and simply stops receiving events. pi-chat records the last inbound frame, protocol pong, or dispatched event — a successful outbound ping is not proof of life — and replaces the `WSClient` when that activity is older than `staleTimeoutMs` or the socket closes. Reconnect uses exponential backoff with jitter. Message IDs already seen in this process, including ones loaded from the channel log at connect, are not handled again.
+
+All four fields are optional. Omitted fields use the defaults:
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `healthCheckIntervalMs` | `15000` | How often to compare last inbound activity with `staleTimeoutMs` |
+| `staleTimeoutMs` | `300000` | No inbound frame/pong/event for this long destroys and recreates the client |
+| `reconnectMinDelayMs` | `1000` | Delay before the first rebuild. Later attempts double |
+| `reconnectMaxDelayMs` | `60000` | Cap for that delay, including jitter |
+
+```json
+"websocket": {
+  "healthCheckIntervalMs": 15000,
+  "staleTimeoutMs": 300000,
+  "reconnectMinDelayMs": 1000,
+  "reconnectMaxDelayMs": 60000
+}
+```
+
+Put `websocket` on the Feishu account next to `eventMode`. It is ignored in HTTP callback mode. Values must be positive integers, and `reconnectMinDelayMs` must be less than or equal to `reconnectMaxDelayMs`. Invalid values fail connect before a platform call.
+
+`staleTimeoutMs` must be longer than the platform ping interval. The SDK default before the server pushes its own value is 120 seconds; the 5 minute default allows a couple of missed pongs. A shorter window rebuilds a healthy idle connection. The delay for attempt `n` (1-based) is `min(max, min * 2^(n-1))`, then multiplied by `0.75 + 0.25 * random()` so jitter never exceeds the cap.
+
+Connect, disconnect, stale, and reconnect lines go to stderr as `[pi-chat feishu] ...`. The same transitions are appended to the channel log as `feishu-ws <type>: <message>` and the current link is stored on the worker status snapshot. `/status` includes:
+
+```text
+Feishu WS: connected
+Feishu WS activity: 2026-04-08T19:45:00.000Z
+Feishu WS reconnects: 0
+```
+
+`activity` is the last inbound proof of life, not the last outbound ping. While the link is down, the state is `stale`, `disconnected`, or `reconnecting` instead of `connected`.
 
 ## HTTP callback example (existing deployments)
 
@@ -177,7 +213,8 @@ WebSocket (no public URL):
 - A permitted user mentioning the bot in the configured chat receives a pi reply.
 - Other chats, disallowed users and bot self-messages do not trigger replies.
 - DMs configured with `dm: true` trigger without @mentions.
-- Duplicate deliveries do not create duplicate jobs; long replies are chunked.
+- Duplicate deliveries do not create duplicate jobs; long replies are chunked. A redelivery after the long connection rebuilds is deduped by message ID.
+- Dropping the network path logs a disconnect to stderr within the stale window, rebuilds the client, and `/status` shows the link state, last activity, and reconnect count.
 - `status`/`stop` work with the bot mention; `chat_attach` uploads a generated file.
 - Disconnect closes the socket; reconnect accepts new events. A second client of the same app does not reliably receive events.
 

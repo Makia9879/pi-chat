@@ -10,7 +10,7 @@
 | --- | --- |
 | Discord / Telegram | 保留原适配器及原运行模式；增加共享运行后端和工作目录选择能力 |
 | Feishu / Lark | HTTP 事件回调与 WebSocket 长连接；身份、文本/富文本接收、文本回复和出站文件上传 |
-| 飞书接入方式 | 自建应用 Bot。新配置显式 `eventMode: "websocket"`（官方 SDK 长连接，无需公网回调）。没有该字段的旧配置保持 HTTP 回调。不是自定义机器人 incoming webhook |
+| 飞书接入方式 | 自建应用 Bot。新配置显式 `eventMode: "websocket"`（官方 SDK 长连接，无需公网回调）。没有该字段的旧配置保持 HTTP 回调。不是自定义机器人 incoming webhook。长连接有健康看门狗：关闭或入站活动超时后重建 `WSClient` |
 | 飞书并发频道范围 | 一个 App 一个活动频道。HTTP worker 还需要不同端口；WebSocket 不占 webhook 端口，但同一 App 多个长连接只有一个会收到事件 |
 | 默认执行模式 | `gondolin`，旧配置无需修改 |
 | 本地模式 | 显式 `runtime.mode: "local"`；宿主机文件工具和 bash，不启动 microVM |
@@ -18,7 +18,7 @@
 | 自定义工作目录 | 全局、账号、频道三级 `runtime.workspaceDir`，逐字段继承 |
 | 无消息平台会话 | `--chat-local`，可配合 `--chat-workspace /workspace` |
 | 检查 | `npm run check` 与 `npm test` 在补丁后复跑通过；提交前再跑 `git diff --check` |
-| 自动化测试 | 32 个测试通过，入口为 `tests/*.test.ts`。不连接真实飞书、模型供应商或 pi 斜杠运行时 |
+| 自动化测试 | 40 个测试通过，入口为 `tests/*.test.ts`。不连接真实飞书、模型供应商或 pi 斜杠运行时 |
 | 真实模型测试 | `openai/gpt-6-luna:low` 已启动、调用本地 bash 并正常回复，退出码 0 |
 | 本地安装 | 已执行 `pi install /workspace/pi-chat`，`pi list` 可见源码目录 |
 | Git | 改动位于工作树；本轮未执行 git push |
@@ -83,7 +83,8 @@ Discord Gateway / Telegram polling / Feishu HTTP callbacks or WebSocket
 | `src/live/index.ts` | 按 service 路由，未知 service 明确报错 |
 | `src/live/discord.ts` | discord.js gateway、catch-up、发送、附件、连接异常处理 |
 | `src/live/telegram.ts` | long polling、offset、媒体组、发送、附件 |
-| `src/live/feishu.ts` | HTTP callback、安全验证、消息转换、去重、回复和上传 |
+| `src/live/feishu.ts` | HTTP callback、安全验证、消息转换、去重、回复和上传；WebSocket 会话交给看门狗 |
+| `src/live/feishu-ws.ts` | 长连接健康看门狗、活动时间、指数退避和状态文本 |
 | `src/live/common.ts` | 附件读写、MIME 和 mention 辅助函数 |
 | `src/services/*` | 设置阶段的身份验证和 discovery；飞书文件同时提供 REST client |
 | `src/tui/*` | `/chat-config` 和 guided setup |
@@ -353,14 +354,47 @@ callback 串行进入 Promise queue。已处理 message ID 保存在最多 10,00
 - App ID 必须匹配 SDK 的 `cli_` + 16 位十六进制，否则 `WSClient.start()` 会直接返回且不连。连接前抛出明确错误，不发网络请求。
 - 生产路径等待首次 `onReady`，超时 30 秒后 `close({ force: true })`。握手超时 15 秒。自动化测试注入 session factory，驱动真实 `EventDispatcher.invoke(..., { needCheck: false })`，**不会**打开飞书 WebSocket。
 - SDK 把 schema 2.0 信封展平后交给 `im.message.receive_v1` handler。适配器还原成 `FeishuEvent` 再走 `feishuMessageToInput()`。`app_id` 不匹配则直接 ack 丢弃，避免 500 重试风暴。
-- 只等待日志写入，不等待模型，以落在平台约 3 秒的处理窗口内。串行队列和 message ID 去重与 HTTP 相同。
+- 只等待日志写入，不等待模型，以落在平台约 3 秒的处理窗口内。串行队列和 message ID 去重与 HTTP 相同。看门狗重建客户端时不新建 runtime，内存里的 seen set 继续有效，因此平台重推不会再入队。
 - 长连接是集群投递，不是广播。同一 App 多个在线客户端只有一个会收到事件。预检仍要求一个 App 一个频道。WebSocket worker 不占用 webhook 端口；HTTP worker 仍要求端口互斥。
 - 长连接只支持事件订阅，不支持卡片回调。本项目本来不用卡片回调。
-- 重试耗尽等终端错误写入 runtime error，并触发已有 `onDisconnect` 重连。正常 disconnect 强制关闭 socket。
+- 首次握手失败仍然让 `connectFeishuLive()` 抛出，由现有连接失败路径清理。握手成功之后的关闭、SDK 错误和活动超时由看门狗销毁并新建 `WSClient`，**不再**调用 `onDisconnect`。那条路径会拆掉整个 adapter 再 `connectConversation()`，会和看门狗抢同一条连接。
+- 正常 disconnect 先尝试发送 WebSocket CLOSE，再 `close({ force: true })`，并停掉看门狗。退避 sleep 不 `unref`，否则半开连接被拆掉后进程可能在重连前退出；健康检查 interval 会 `unref`。
 
 HTTP 回调继续用自有 `decodeFeishuEvent()`，不改走 SDK dispatcher：SDK 在未配置 Encrypt Key 时不校验 Verification Token，签名也比较重新序列化后的 JSON，而不是 raw body。
 
 控制台必须把订阅方式设成「使用长连接接收事件」，并订阅 `im.message.receive_v1`，然后发布版本。不要同时配置请求地址 URL。出站仍要能访问 `open.feishu.cn` 或 `open.larksuite.com`。
+
+##### SDK 静默断线（`@larksuiteoapi/node-sdk` 1.74.0）
+
+现象：worker 进程还在，但从某一时刻起收不到任何事件，stderr 也没有错误。这和 SDK 的默认状态机一致，不是进程崩溃。
+
+`WSClient` 构造时的默认值（服务器随后会覆盖）：
+
+| 字段 | 默认 | 说明 |
+| --- | --- | --- |
+| `pingInterval` | 120s | 应用层 protobuf ping，不是 WebSocket 协议 ping |
+| `reconnectCount` | `-1` | 无限重试，直到 `pullConnectConfig` 或 pong 写入服务器给的次数 |
+| `reconnectInterval` | 120s | 第一次随机等待之后，每次失败的固定间隔 |
+| `reconnectNonce` | 30s | 进入重连循环后的随机等待上限 |
+| `autoReconnect` | `true` | pi-chat 现在显式关掉，避免和自己的重建抢连接 |
+
+服务器在 `POST /callback/ws/endpoint` 的 `ClientConfig` 里下发 `PingInterval`、`ReconnectCount`、`ReconnectInterval`、`ReconnectNonce`，单位是秒，SDK 乘 1000。之后每次 pong 再覆盖一次。这些值不是客户端能在 `WSConfigOverrides` 里改的。
+
+静默窗口的直接原因：
+
+1. **半开 TCP 不产生 `close`/`error`。** NAT、防火墙或服务端丢掉路径时，`ws` 的 `readyState` 可以一直是 `OPEN`。`send()` 把 ping 放进内核缓冲区就算成功。Linux TCP keepalive/重传常常要十几分钟到两小时才宣告死亡。worker 活着、没有异常、事件全停，和这种窗口一致。
+2. **SDK 的 pong 看门狗默认关闭。** `armLiveness()` 只在构造参数 `wsConfig.pingTimeout`（秒）大于 0 时工作。未设置时 `pingTimeoutSec` 为 0，看门狗是空操作。注释写明这是为了保留“只等 socket 错误”的旧行为。旧的 pi-chat 没有传这个参数。
+3. **`pingTimeout` 还必须短于 ping 间隔。** 每次 ping 都会清掉并重装看门狗。若 `pingTimeout >= pingInterval`，下一次 ping 会在定时器触发前重置它，缺 pong 也永远不会拆连接。因此这里固定传 45 秒，只作为 120 秒默认 ping 下的加速器；真正的阈值是看门狗的 `staleTimeoutMs`。
+4. **`error` 不重连，`close` 几乎不打日志。** `error` 回调只记 `'ws error'`，不带错误对象，也不调用 `reConnect()`。`close` 才调用 `reConnect()`，但日志级别是 `debug`。pi-chat 以前把 SDK logger 设在 `info`，所以即便真的关闭也看不见。ping/pong 是 `trace`。默认 logger 的 `error` 走 `console.log`（stdout），不走 stderr。
+5. **发送失败不会拆 socket。** `send` 回调失败只记 `'send data failed'`。
+6. **SDK 自己的重连不可靠，不能当唯一手段。** `autoReconnect: false` 且曾经连上过时，`reConnect()` 直接返回，不触发 `onError`/`onReconnecting`。`isConnecting` 会丢掉并发的 `reConnect()`。服务器若把 `ReconnectCount` 推成很小的数，循环耗尽后进入 `failed` 并不再试。`exceed_conn_limit`（1000040350）在 `pullConnectConfig` 里被当成不可重试，SDK 会放弃；新连接和旧端点短暂并存时可能踩到这个码。
+7. **关连接时如果不发 CLOSE，服务端会继续把事件路由到旧端点。** Hermes 在 #10202 里记录过：不先发 CLOSE 就拆线程，飞书会把消息送到已经死掉的连接，静默可持续到服务端 CLOSE-WAIT 超时（数分钟到数小时）。
+
+Hermes `plugins/platforms/feishu/adapter.py` 的做法是：给 Python SDK 注入 ping timeout，监听 `on_reconnecting` 写运行状态，用 supervisor 在接收线程退出后按指数退避重建客户端（上限 60 秒），拆线前关掉 SDK auto reconnect 并发送 CLOSE。Node SDK 的失败形态不同：线程不会死，半开的 client 对象还活着。所以这里不依赖 SDK 的重连阶梯，而是在关闭或活动超时后销毁整个 `WSClient` 再新建一个。退避公式和上限与 Hermes 的“有上限的指数退避”同一类，抖动被限制在当前档位的 75%–100%，不会超过 `reconnectMaxDelayMs`。
+
+活动时间只记录入站帧（含应用层 pong）、WebSocket 协议 pong、dispatcher 事件和握手成功。出站 ping 的 `send` 成功不算活动，否则半开连接会一直被刷新。健康检查还读 SDK `getConnectionStatus()`：状态不再是 `connected` 时立刻重建。若服务器 ping 间隔大于等于 `staleTimeoutMs`，stderr 告警一次，避免把健康空闲连接拆掉；阈值本身不被悄悄放大，否则用户配的超时不会生效。
+
+连接、断开、过期、重连和关闭都 `console.error` 到 stderr，前缀 `[pi-chat feishu]`。同一事件经 `onConnectionEvent` 写入频道日志 `error` 记录（`feishu-ws <type>: ...`），因为现有日志类型里没有单独的链路事件。worker status 的 `feishuWs` 和 `/status` 展示当前状态、最近活动时间和重连次数。配置项见 [configuration.md](configuration.md)。
 
 #### 部署限制
 
@@ -463,7 +497,8 @@ Gondolin HTTP-hook secrets 的 host 限制不能在本地复现，所以 local s
 | `src/gondolin.ts` | 修改 | 新增 `mode/workspacePath/sharedPath`，其余 VM 工具实现保留 |
 | `src/runtime.ts` | 修改 | transcript 附件路径改用统一 `displayPath()`，队列/消费边界核心算法未重写 |
 | `src/secrets.ts` | 修改 | secret name 限制为简单文件名；请求绑定 conversation；写入 0600/目录 0700 |
-| `src/live/feishu.ts` | 新增 | HTTP callback server；WebSocket 使用官方 `WSClient` + `EventDispatcher`；AES/token/signature、nonce、转换/去重、回复/上传、断开 |
+| `src/live/feishu.ts` | 新增 | HTTP callback server；WebSocket 使用官方 `WSClient` + `EventDispatcher`；AES/token/signature、nonce、转换/去重、回复/上传、断开。看门狗接入后不再把长连接终端错误转成 `onDisconnect` |
+| `src/live/feishu-ws.ts` | 新增 | 长连接活动时间、过期检测、销毁重建、指数退避和 `/status` 文本 |
 | `src/live/index.ts` | 修改 | 显式 Telegram/Discord/Feishu 路由和未知 service 错误 |
 | `src/render/format.ts` | 修改 | Feishu plain-text 分支，避免误用 Discord mention 格式化 |
 | `src/services/feishu.ts` | 新增 | tenant REST client、identity、Feishu discovery provider |
@@ -480,7 +515,8 @@ Gondolin HTTP-hook secrets 的 host 限制不能在本地复现，所以 local s
 | `tests/helpers.ts` | 新增 | 临时目录 conversation fixture，避免测试改写真实聊天数据 |
 | `tests/runtime.test.ts` | 新增 | 配置/继承、路径提示、worker 冲突、trigger/失败边界/DM 回归 |
 | `tests/local.test.ts` | 新增 | 本地工具、cwd、附件、env、timeout/abort/close、VM secrets 拒绝 |
-| `tests/feishu.test.ts` | 新增 | callback 安全、转换、REST token、HTTP adapter、分片/上传、重连去重、重放和 reply fallback |
+| `tests/feishu.test.ts` | 新增 | callback 安全、转换、REST token、HTTP adapter、分片/上传、重连去重、重放和 reply fallback。另覆盖看门狗重建后的 message id 去重 |
+| `tests/feishu-ws.test.ts` | 新增 | 健康阈值、退避抖动、socket 活动探测、过期/关闭重建、断开停止重连、stderr |
 | `README.md` | 修改 | 新功能、安装、运行配置、限制、测试说明 |
 | `AGENTS.md` | 修改 | 架构及开发约定同步到双后端/Feishu |
 | `docs/configuration.md` | 新增 | 可复制配置、启动方式和飞书人工验收清单 |

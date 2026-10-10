@@ -10,6 +10,18 @@ import { chunkText } from "../render/chunking.js";
 import { formatMarkdownForService } from "../render/format.js";
 import { FeishuClient } from "../services/feishu.js";
 import { readLocalAttachment } from "./common.js";
+import {
+	attachFeishuWsActivityHooks,
+	defaultFeishuWsLog,
+	FEISHU_SDK_PING_TIMEOUT_SEC,
+	type FeishuWsHealthConfig,
+	type FeishuWsHooks,
+	type FeishuWsSession,
+	FeishuWsSupervisor,
+	type FeishuWsSupervisorOptions,
+	readFeishuSdkPingIntervalMs,
+	resolveFeishuWsHealth,
+} from "./feishu-ws.js";
 import type { LiveConnection, LiveConnectionHandlers, LiveProcessingOutcome } from "./types.js";
 
 /** Official SDK `WSClient.start` rejects any other App ID and returns without connecting. */
@@ -46,14 +58,7 @@ export interface FeishuSdkMessageData {
 	schema?: string;
 }
 
-export interface FeishuWsSession {
-	start(dispatcher: EventDispatcher): Promise<void>;
-	close(): void;
-}
-
-export interface FeishuWsHooks {
-	onTerminalError?: (error: Error) => void;
-}
+export type { FeishuWsHooks, FeishuWsSession } from "./feishu-ws.js";
 
 export type FeishuWsSessionFactory = (account: FeishuAccountConfig, hooks: FeishuWsHooks) => FeishuWsSession;
 
@@ -62,6 +67,15 @@ export interface ConnectFeishuLiveOptions {
 	wsSessionFactory?: FeishuWsSessionFactory;
 	/** Test seam. Production reads `process.env`, including `FEISHU_REACTIONS`. */
 	env?: NodeJS.ProcessEnv;
+	/** Test seam. Production uses `account.websocket` and real timers. */
+	wsControl?: {
+		now?: FeishuWsSupervisorOptions["now"];
+		sleep?: FeishuWsSupervisorOptions["sleep"];
+		random?: FeishuWsSupervisorOptions["random"];
+		schedule?: FeishuWsSupervisorOptions["schedule"];
+		log?: FeishuWsSupervisorOptions["log"];
+		health?: unknown;
+	};
 }
 
 const FEISHU_REACTION_CACHE = 1024;
@@ -157,19 +171,35 @@ export function feishuEventFromSdkData(data: FeishuSdkMessageData): FeishuEvent 
 
 export function createFeishuWsClient(
 	account: FeishuAccountConfig,
-	callbacks?: { onReady?: () => void; onError?: (error: Error) => void; onReconnecting?: () => void },
+	callbacks?: {
+		onReady?: () => void;
+		onError?: (error: Error) => void;
+		onReconnecting?: () => void;
+		onReconnected?: () => void;
+	},
 ): WSClient {
 	return new WSClient({
 		appId: account.appId,
 		appSecret: account.appSecret,
 		domain: feishuSdkDomain(account.domain),
-		loggerLevel: LoggerLevel.info,
-		autoReconnect: true,
+		loggerLevel: LoggerLevel.warn,
+		logger: {
+			error: (message: unknown) => console.error("[pi-chat feishu] sdk", message),
+			warn: (message: unknown) => console.error("[pi-chat feishu] sdk", message),
+			info: () => undefined,
+			debug: () => undefined,
+			trace: () => undefined,
+		},
+		// The SDK ladder misses half-open sockets and can stop on server codes such as
+		// exceed_conn_limit. Rebuilding here would also race that ladder, so it stays off.
+		autoReconnect: false,
 		handshakeTimeoutMs: 15_000,
+		wsConfig: { pingTimeout: FEISHU_SDK_PING_TIMEOUT_SEC },
 		source: "pi-chat",
 		onReady: callbacks?.onReady,
 		onError: callbacks?.onError,
 		onReconnecting: callbacks?.onReconnecting,
+		onReconnected: callbacks?.onReconnected,
 	});
 }
 
@@ -196,59 +226,88 @@ export function createDefaultFeishuWsSession(account: FeishuAccountConfig, hooks
 	assertFeishuWebSocketAppId(account.appId);
 	let resolveReady: (() => void) | undefined;
 	let rejectReady: ((error: Error) => void) | undefined;
+	let handshakeTimer: ReturnType<typeof setTimeout> | undefined;
 	let handshakeSettled = false;
-	let connected = false;
+	let sessionClosed = false;
+	const failHandshake = (error: Error) => {
+		if (handshakeSettled) return;
+		handshakeSettled = true;
+		if (handshakeTimer) clearTimeout(handshakeTimer);
+		const reject = rejectReady;
+		resolveReady = undefined;
+		rejectReady = undefined;
+		reject?.(error);
+	};
+	const wrapped: FeishuWsHooks = {
+		onActivity: (kind) => hooks.onActivity?.(kind),
+		onLinkDown: (reason) => {
+			if (!handshakeSettled) failHandshake(new Error(`Feishu WebSocket ${reason}`));
+			hooks.onLinkDown?.(reason);
+		},
+	};
 	const client = createFeishuWsClient(account, {
 		onReady: () => {
 			if (handshakeSettled) return;
 			handshakeSettled = true;
-			connected = true;
+			if (handshakeTimer) clearTimeout(handshakeTimer);
+			hooks.onActivity?.("ready");
 			resolveReady?.();
 			resolveReady = undefined;
 			rejectReady = undefined;
 		},
 		onError: (error) => {
-			if (!connected && !handshakeSettled) {
-				handshakeSettled = true;
-				rejectReady?.(error);
-				resolveReady = undefined;
-				rejectReady = undefined;
+			if (!handshakeSettled) {
+				failHandshake(error);
 				return;
 			}
-			if (connected) hooks.onTerminalError?.(error);
+			hooks.onTerminalError?.(error);
+			hooks.onLinkDown?.(`sdk error: ${error.message}`);
 		},
 	});
+	const activity = attachFeishuWsActivityHooks(client, wrapped);
+	if (!activity.instrumented) {
+		console.error("[pi-chat feishu] unable to instrument WSClient; stale timeout is the only half-open signal");
+	}
+	const forceClose = () => {
+		activity.releaseSocket();
+		client.close({ force: true });
+	};
 	return {
 		start(dispatcher) {
+			if (sessionClosed) return Promise.reject(new Error("Feishu WebSocket closed"));
 			return new Promise<void>((resolve, reject) => {
-				const timer = setTimeout(() => {
-					if (handshakeSettled) return;
-					handshakeSettled = true;
-					client.close({ force: true });
-					reject(new Error("Feishu WebSocket connection timed out"));
+				handshakeTimer = setTimeout(() => {
+					failHandshake(new Error("Feishu WebSocket connection timed out"));
+					forceClose();
 				}, FEISHU_WS_CONNECT_TIMEOUT_MS);
-				resolveReady = () => {
-					clearTimeout(timer);
-					resolve();
-				};
+				resolveReady = () => resolve();
 				rejectReady = (error) => {
-					clearTimeout(timer);
-					client.close({ force: true });
+					forceClose();
 					reject(error);
 				};
-				void client.start({ eventDispatcher: dispatcher }).catch((error: unknown) => {
-					if (handshakeSettled) return;
-					handshakeSettled = true;
-					clearTimeout(timer);
-					client.close({ force: true });
-					reject(error instanceof Error ? error : new Error(String(error)));
+				void client.start({ eventDispatcher: dispatcher as EventDispatcher }).catch((error: unknown) => {
+					failHandshake(error instanceof Error ? error : new Error(String(error)));
+					forceClose();
 				});
 			});
 		},
 		close() {
-			handshakeSettled = true;
-			client.close({ force: true });
+			if (sessionClosed) return;
+			sessionClosed = true;
+			failHandshake(new Error("Feishu WebSocket closed"));
+			forceClose();
 		},
+		socketState: () => {
+			try {
+				const state = client.getConnectionStatus().state;
+				if (state === "connected") return "open";
+				if (state === "connecting" || state === "reconnecting") return "unknown";
+				return "closed";
+			} catch {
+				return "unknown";
+			}
+		},
+		pingIntervalMs: () => readFeishuSdkPingIntervalMs(client),
 	};
 }
 
@@ -555,13 +614,17 @@ export async function connectFeishuLive(
 	if (conversation.account.service !== "feishu") throw new Error("Expected Feishu account");
 	const account = { ...conversation.account };
 	const eventMode = resolveFeishuEventMode(account);
+	let wsHealth: FeishuWsHealthConfig | undefined;
 	if (eventMode === "http") {
 		if (!account.verificationToken?.trim()) throw new Error("Feishu Verification Token is required");
 		const path = account.webhook?.path ?? "/feishu/events";
 		const port = account.webhook?.port ?? 3000;
 		if (!path.startsWith("/") || !Number.isInteger(port) || port < 1 || port > 65535)
 			throw new Error("Invalid Feishu webhook path or port");
-	} else assertFeishuWebSocketAppId(account.appId);
+	} else {
+		assertFeishuWebSocketAppId(account.appId);
+		wsHealth = resolveFeishuWsHealth(options?.wsControl?.health ?? account.websocket);
+	}
 	const api = new FeishuClient(account);
 	account.botUserId = (await api.identity()).id;
 	conversation.account.botUserId = account.botUserId;
@@ -599,15 +662,28 @@ export async function connectFeishuLive(
 	};
 
 	if (eventMode === "websocket") {
+		const health = wsHealth ?? resolveFeishuWsHealth(account.websocket);
+		const log = options?.wsControl?.log ?? defaultFeishuWsLog;
+		if (health.staleTimeoutMs < 120_000) {
+			log(
+				"[pi-chat feishu] websocket.staleTimeoutMs is below the SDK default 120s ping interval; a healthy idle connection may be rebuilt. Raise it unless the platform ping interval is shorter.",
+			);
+		}
 		const factory = options?.wsSessionFactory ?? createDefaultFeishuWsSession;
-		const session = factory(account, {
-			onTerminalError: (error) => {
-				if (state.closed) return;
-				void report(error);
-				void handlers.onDisconnect?.();
+		const supervisor = new FeishuWsSupervisor({
+			health,
+			createSession: (hooks) => factory(account, hooks),
+			now: options?.wsControl?.now,
+			sleep: options?.wsControl?.sleep,
+			random: options?.wsControl?.random,
+			schedule: options?.wsControl?.schedule,
+			log,
+			onEvent: (event) => {
+				void Promise.resolve(handlers.onConnectionEvent?.(event)).catch(() => undefined);
 			},
 		});
 		const dispatcher = createFeishuMessageDispatcher(account, async (data) => {
+			supervisor.noteActivity("event");
 			if (data.app_id && data.app_id !== account.appId) return;
 			if (data.header?.app_id && data.header.app_id !== account.appId) return;
 			const event = feishuEventFromSdkData(data);
@@ -616,15 +692,16 @@ export async function connectFeishuLive(
 		});
 		dispatcher.register({
 			"card.action.trigger": async (data: Parameters<typeof feishuCardSelection>[0]) => {
+				supervisor.noteActivity("event");
 				await emitCardAction(data);
 			},
 		});
 		// No historical catch-up API is used. Only newly delivered events trigger jobs.
 		await handlers.onCaughtUp();
 		try {
-			await session.start(dispatcher);
+			await supervisor.start(dispatcher);
 		} catch (error) {
-			session.close();
+			supervisor.close();
 			throw error;
 		}
 		return {
@@ -632,10 +709,11 @@ export async function connectFeishuLive(
 			...outbound,
 			...reactions,
 			...idlePreview(),
+			connectionStatus: () => supervisor.status(),
 			disconnect: async () => {
 				if (state.closed) return;
 				state.closed = true;
-				session.close();
+				supervisor.close();
 				await queue;
 			},
 		};
