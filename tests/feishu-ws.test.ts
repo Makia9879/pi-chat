@@ -253,3 +253,48 @@ test("Feishu websocket supervisor logs connect and close to stderr", async () =>
 	assert.match(text, /WebSocket closed/);
 	assert.match(text, /server ping interval 400000ms/);
 });
+
+test("Feishu socket instrumentation sends protocol pings on an interval and stops on close", () => {
+	const socket = new EventEmitter() as EventEmitter & { readyState: number; ping: () => void; close: () => void };
+	socket.readyState = 1;
+	let pings = 0;
+	socket.ping = () => {
+		pings++;
+	};
+	socket.close = () => {};
+	let tick: (() => void) | undefined;
+	let cleared = 0;
+	const client = { wsConfig: { getWSInstance: () => socket }, communicate() {} };
+	attachFeishuWsActivityHooks(
+		client,
+		{},
+		{
+			protocolPingMs: 20_000,
+			setInterval: ((fn: () => void) => {
+				tick = fn;
+				return 1;
+			}) as unknown as typeof setInterval,
+			clearInterval: (() => {
+				cleared++;
+			}) as unknown as typeof clearInterval,
+		},
+	);
+	client.communicate();
+	tick?.();
+	tick?.();
+	assert.equal(pings, 2);
+	socket.emit("close");
+	assert.ok(cleared >= 1);
+});
+
+test("Feishu websocket log lines carry the event timestamp", () => {
+	assert.match(
+		formatFeishuWsLog({
+			type: "stale",
+			message: "WebSocket stale",
+			at: "2026-10-10T15:00:00.000Z",
+			status: { state: "stale", reconnectCount: 1 },
+		}),
+		/^2026-10-10T15:00:00.000Z \[pi-chat feishu\] WebSocket stale/,
+	);
+});

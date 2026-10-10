@@ -14,8 +14,10 @@ import {
 	attachFeishuWsActivityHooks,
 	defaultFeishuWsLog,
 	FEISHU_SDK_PING_TIMEOUT_SEC,
+	FEISHU_WS_PROTOCOL_PING_MS,
 	type FeishuWsHealthConfig,
 	type FeishuWsHooks,
+	type FeishuWsLinkEvent,
 	type FeishuWsSession,
 	FeishuWsSupervisor,
 	type FeishuWsSupervisorOptions,
@@ -307,7 +309,8 @@ export function createDefaultFeishuWsSession(account: FeishuAccountConfig, hooks
 				return "unknown";
 			}
 		},
-		pingIntervalMs: () => readFeishuSdkPingIntervalMs(client),
+		// Protocol pings (attachFeishuWsActivityHooks) bound the effective liveness interval.
+		pingIntervalMs: () => Math.min(readFeishuSdkPingIntervalMs(client) ?? Infinity, FEISHU_WS_PROTOCOL_PING_MS),
 	};
 }
 
@@ -406,6 +409,64 @@ async function loadSeenMessageIds(conversation: ResolvedConversation): Promise<S
 			)
 			.slice(-10000),
 	);
+}
+
+interface FeishuListedMessage {
+	message_id?: string;
+	msg_type?: string;
+	create_time?: string;
+	deleted?: boolean;
+	chat_id?: string;
+	sender?: { id?: string; id_type?: string; sender_type?: string };
+	body?: { content?: string };
+	mentions?: Array<{ key: string; id?: string; name?: string }>;
+}
+
+/** Convert an `im/v1/messages` list item into the receive_v1 event shape. User messages only. */
+export function feishuListedMessageToEvent(item: FeishuListedMessage, chatId: string): FeishuEvent | undefined {
+	if (!item.message_id || item.deleted || item.sender?.sender_type !== "user") return undefined;
+	if (item.sender.id_type && item.sender.id_type !== "open_id") return undefined;
+	return {
+		header: { event_type: "im.message.receive_v1" },
+		event: {
+			sender: { sender_id: { open_id: item.sender.id }, sender_type: "user" },
+			message: {
+				message_id: item.message_id,
+				chat_id: item.chat_id ?? chatId,
+				message_type: item.msg_type,
+				content: item.body?.content,
+				mentions: item.mentions?.map((m) => ({ key: m.key, name: m.name, id: { open_id: m.id } })),
+			},
+		},
+	};
+}
+
+/** Messages in a chat created at or after `sinceMs`, oldest first. */
+export async function listFeishuMessagesSince(
+	api: Pick<FeishuClient, "request">,
+	chatId: string,
+	sinceMs: number,
+	maxPages = 5,
+): Promise<FeishuListedMessage[]> {
+	const out: FeishuListedMessage[] = [];
+	let pageToken: string | undefined;
+	for (let page = 0; page < maxPages; page++) {
+		const query = new URLSearchParams({
+			container_id_type: "chat",
+			container_id: chatId,
+			start_time: String(Math.max(0, Math.floor(sinceMs / 1000))),
+			sort_type: "ByCreateTimeAsc",
+			page_size: "50",
+		});
+		if (pageToken) query.set("page_token", pageToken);
+		const result = await api.request<{
+			data?: { items?: FeishuListedMessage[]; has_more?: boolean; page_token?: string };
+		}>(`/im/v1/messages?${query}`, undefined, undefined, undefined, "GET");
+		out.push(...(result.data?.items ?? []));
+		if (!result.data?.has_more || !result.data.page_token) break;
+		pageToken = result.data.page_token;
+	}
+	return out;
 }
 
 function rememberMessage(seen: Set<string>, messageId: string): void {
@@ -664,12 +725,43 @@ export async function connectFeishuLive(
 	if (eventMode === "websocket") {
 		const health = wsHealth ?? resolveFeishuWsHealth(account.websocket);
 		const log = options?.wsControl?.log ?? defaultFeishuWsLog;
-		if (health.staleTimeoutMs < 120_000) {
+		if (health.staleTimeoutMs < FEISHU_WS_PROTOCOL_PING_MS * 2) {
 			log(
-				"[pi-chat feishu] websocket.staleTimeoutMs is below the SDK default 120s ping interval; a healthy idle connection may be rebuilt. Raise it unless the platform ping interval is shorter.",
+				`[pi-chat feishu] websocket.staleTimeoutMs is below twice the ${FEISHU_WS_PROTOCOL_PING_MS}ms protocol ping interval; a healthy idle connection may be rebuilt.`,
 			);
 		}
 		const factory = options?.wsSessionFactory ?? createDefaultFeishuWsSession;
+		// Missed-event catch-up: when the link drops, remember the last activity
+		// time; after reconnect, list the chat's messages since then and feed user
+		// messages through `ingest`, which dedupes by message_id against live events.
+		let downSince: number | undefined;
+		const catchUp = async (sinceMs: number) => {
+			const items = await listFeishuMessagesSince(api, conversation.channel.id, sinceMs - 5_000);
+			let fed = 0;
+			for (const item of items) {
+				const event = feishuListedMessageToEvent(item, conversation.channel.id);
+				const id = event?.event?.message?.message_id;
+				if (!event || !id || seen.has(id)) continue;
+				fed++;
+				await ingest(event);
+			}
+			log(
+				`${new Date().toISOString()} [pi-chat feishu] reconnect catch-up since ${new Date(sinceMs).toISOString()}: ${items.length} listed, ${fed} new`,
+			);
+		};
+		const onLinkEvent = (event: FeishuWsLinkEvent) => {
+			if ((event.type === "stale" || event.type === "disconnected") && downSince === undefined) {
+				const last = event.status.lastActivityAt ? Date.parse(event.status.lastActivityAt) : Number.NaN;
+				downSince = Number.isFinite(last) ? last : Date.now();
+			} else if (event.type === "reconnected" && downSince !== undefined) {
+				const since = downSince;
+				downSince = undefined;
+				void catchUp(since).catch((error: unknown) => {
+					const text = error instanceof Error ? error.message : String(error);
+					log(`${new Date().toISOString()} [pi-chat feishu] reconnect catch-up failed: ${text}`);
+				});
+			}
+		};
 		const supervisor = new FeishuWsSupervisor({
 			health,
 			createSession: (hooks) => factory(account, hooks),
@@ -679,6 +771,7 @@ export async function connectFeishuLive(
 			schedule: options?.wsControl?.schedule,
 			log,
 			onEvent: (event) => {
+				onLinkEvent(event);
 				void Promise.resolve(handlers.onConnectionEvent?.(event)).catch(() => undefined);
 			},
 		});
@@ -696,7 +789,7 @@ export async function connectFeishuLive(
 				await emitCardAction(data);
 			},
 		});
-		// No historical catch-up API is used. Only newly delivered events trigger jobs.
+		// No catch-up at startup; reconnects catch up via onLinkEvent above.
 		await handlers.onCaughtUp();
 		try {
 			await supervisor.start(dispatcher);

@@ -766,3 +766,54 @@ test("Feishu websocket reconnect keeps message dedup and still accepts a new eve
 	await dispatcher?.invoke(envelope("om_new"), { needCheck: false });
 	assert.deepEqual(received, ["om_again", "om_new"]);
 });
+
+test("Feishu reconnect catch-up lists messages since a time and keeps user messages only", async () => {
+	const { feishuListedMessageToEvent, listFeishuMessagesSince } = await import("../src/live/feishu.js");
+	const paths: string[] = [];
+	const pages = [
+		{
+			data: {
+				items: [
+					{
+						message_id: "om_1",
+						msg_type: "text",
+						chat_id: "oc_1",
+						sender: { id: "ou_u", id_type: "open_id", sender_type: "user" },
+						body: { content: '{"text":"hi"}' },
+					},
+				],
+				has_more: true,
+				page_token: "p2",
+			},
+		},
+		{
+			data: {
+				items: [
+					{
+						message_id: "om_2",
+						msg_type: "text",
+						chat_id: "oc_1",
+						sender: { id: "cli_x", id_type: "app_id", sender_type: "app" },
+						body: { content: '{"text":"bot"}' },
+					},
+				],
+				has_more: false,
+			},
+		},
+	];
+	const api = {
+		request: async <T>(path: string) => {
+			paths.push(path);
+			return pages.shift() as T;
+		},
+	};
+	const items = await listFeishuMessagesSince(api as never, "oc_1", 1_760_000_000_500);
+	assert.equal(items.length, 2);
+	assert.match(paths[0] ?? "", /container_id=oc_1/);
+	assert.match(paths[0] ?? "", /start_time=1760000000/);
+	assert.match(paths[1] ?? "", /page_token=p2/);
+	const events = items.map((item) => feishuListedMessageToEvent(item, "oc_1"));
+	assert.equal(events[0]?.event?.message?.message_id, "om_1");
+	assert.equal(events[0]?.event?.sender?.sender_id?.open_id, "ou_u");
+	assert.equal(events[1], undefined);
+});

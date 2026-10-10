@@ -10,7 +10,7 @@
 
 export const DEFAULT_FEISHU_WS_HEALTH = {
 	healthCheckIntervalMs: 15_000,
-	staleTimeoutMs: 300_000,
+	staleTimeoutMs: 60_000,
 	reconnectMinDelayMs: 1_000,
 	reconnectMaxDelayMs: 60_000,
 } as const;
@@ -22,6 +22,14 @@ export const DEFAULT_FEISHU_WS_HEALTH = {
  * stale timeout is the backstop when no ping is in flight.
  */
 export const FEISHU_SDK_PING_TIMEOUT_SEC = 45;
+
+/**
+ * Milliseconds between WebSocket protocol pings sent on the raw socket. The
+ * SDK only sends an app-level ping every server PingInterval (~120s); protocol
+ * pings make the gateway answer with a `pong` frame often enough that a short
+ * stale timeout can catch half-open links within about a minute.
+ */
+export const FEISHU_WS_PROTOCOL_PING_MS = 20_000;
 
 export interface FeishuWsHealthConfig {
 	healthCheckIntervalMs: number;
@@ -98,6 +106,7 @@ export interface FeishuWorkerStatusFields {
 interface MinimalSocket {
 	readyState?: number;
 	close?: () => void;
+	ping?: () => void;
 	on?: (event: string, listener: (...args: unknown[]) => void) => void;
 	__piChatInstrumented?: boolean;
 }
@@ -163,8 +172,17 @@ export function readFeishuSdkPingIntervalMs(client: object): number | undefined 
 export function attachFeishuWsActivityHooks(
 	client: object,
 	hooks: FeishuWsHooks,
+	options: { protocolPingMs?: number; setInterval?: typeof setInterval; clearInterval?: typeof clearInterval } = {},
 ): { instrumented: boolean; releaseSocket: () => void } {
 	let socket: MinimalSocket | undefined;
+	let pingTimer: ReturnType<typeof setInterval> | undefined;
+	const pingMs = options.protocolPingMs ?? FEISHU_WS_PROTOCOL_PING_MS;
+	const startTimer = options.setInterval ?? setInterval;
+	const stopTimer = options.clearInterval ?? clearInterval;
+	const stopPing = () => {
+		if (pingTimer !== undefined) stopTimer(pingTimer);
+		pingTimer = undefined;
+	};
 	const target = client as {
 		communicate?: () => void;
 		wsConfig?: { getWSInstance?: () => MinimalSocket | null | undefined };
@@ -187,7 +205,22 @@ export function attachFeishuWsActivityHooks(
 		next.__piChatInstrumented = true;
 		next.on?.("message", () => hooks.onActivity?.("frame"));
 		next.on?.("pong", () => hooks.onActivity?.("pong"));
-		next.on?.("close", () => hooks.onLinkDown?.("socket close"));
+		next.on?.("close", () => {
+			if (socket === next) stopPing();
+			hooks.onLinkDown?.("socket close");
+		});
+		stopPing();
+		if (pingMs > 0 && typeof next.ping === "function") {
+			pingTimer = startTimer(() => {
+				try {
+					if (next.readyState === 1) next.ping?.();
+				} catch {
+					// A dead socket may throw; close/error drives the rebuild.
+				}
+			}, pingMs);
+			const timer = pingTimer as { unref?: () => void };
+			if (typeof timer?.unref === "function") timer.unref();
+		}
 		next.on?.("error", (error: unknown) => {
 			const message = error instanceof Error ? error.message : String(error ?? "socket error");
 			hooks.onLinkDown?.(`socket error: ${message}`);
@@ -196,6 +229,7 @@ export function attachFeishuWsActivityHooks(
 	return {
 		instrumented: true,
 		releaseSocket() {
+			stopPing();
 			try {
 				if (socket?.readyState === 1) socket.close?.();
 			} catch {
@@ -207,7 +241,8 @@ export function attachFeishuWsActivityHooks(
 
 export function formatFeishuWsLog(event: FeishuWsLinkEvent): string {
 	const activity = event.status.lastActivityAt ?? "never";
-	return `[pi-chat feishu] ${event.message} (state=${event.status.state}, reconnects=${event.status.reconnectCount}, lastActivity=${activity})`;
+	const at = event.at ? `${event.at} ` : "";
+	return `${at}[pi-chat feishu] ${event.message} (state=${event.status.state}, reconnects=${event.status.reconnectCount}, lastActivity=${activity})`;
 }
 
 export function defaultFeishuWsLog(line: string): void {
@@ -274,6 +309,7 @@ export class FeishuWsSupervisor {
 	private lastDisconnectReason: string | undefined;
 	private lastError: string | undefined;
 	private downDuringOpen: string | undefined;
+	private lastSkipReason: string | undefined;
 	private dispatcher: unknown;
 	private session: FeishuWsSession | undefined;
 	private timer: FeishuWsSchedule | undefined;
@@ -332,7 +368,24 @@ export class FeishuWsSupervisor {
 	}
 
 	checkHealth(): void {
-		if (this.stopped || !this.opened || this.rebuilding || this.opening || this.state !== "connected") return;
+		const skip = this.stopped
+			? "stopped"
+			: !this.opened
+				? "not opened"
+				: this.rebuilding
+					? "rebuilding"
+					: this.opening
+						? "opening"
+						: this.state !== "connected"
+							? `state=${this.state}`
+							: undefined;
+		if (skip !== this.lastSkipReason) {
+			if (skip) this.writeLog(`${new Date(this.now()).toISOString()} [pi-chat feishu] health check skipped: ${skip}`);
+			else if (this.lastSkipReason)
+				this.writeLog(`${new Date(this.now()).toISOString()} [pi-chat feishu] health check resumed`);
+			this.lastSkipReason = skip;
+		}
+		if (skip) return;
 		this.warnIfPingTooSlow();
 		if (this.session?.socketState?.() === "closed") {
 			this.requestRebuild("socket not open");
@@ -351,7 +404,7 @@ export class FeishuWsSupervisor {
 		if (!feishuPingExceedsStale(ping, this.options.health.staleTimeoutMs)) return;
 		this.warnedLongPing = true;
 		this.writeLog(
-			`[pi-chat feishu] server ping interval ${ping}ms is >= websocket.staleTimeoutMs ${this.options.health.staleTimeoutMs}ms; a healthy idle connection can be treated as stale. Raise staleTimeoutMs above the platform ping interval.`,
+			`${new Date(this.now()).toISOString()} [pi-chat feishu] server ping interval ${ping}ms is >= websocket.staleTimeoutMs ${this.options.health.staleTimeoutMs}ms; a healthy idle connection can be treated as stale. Raise staleTimeoutMs above the platform ping interval.`,
 		);
 	}
 
@@ -361,7 +414,7 @@ export class FeishuWsSupervisor {
 		const generation = ++this.generation;
 		void this.rebuild(reason, generation).catch((error: unknown) => {
 			const message = error instanceof Error ? error.message : String(error);
-			this.writeLog(`[pi-chat feishu] WebSocket supervisor failed: ${message}`);
+			this.writeLog(`${new Date(this.now()).toISOString()} [pi-chat feishu] WebSocket supervisor failed: ${message}`);
 			if (generation === this.generation) this.rebuilding = false;
 		});
 	}
