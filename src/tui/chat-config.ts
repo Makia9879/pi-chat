@@ -36,6 +36,7 @@ async function configureRuntime(
 		{ value: "inherit", label: "Inherit (default: Gondolin)" },
 		{ value: "gondolin", label: "Gondolin micro-VM" },
 		{ value: "local", label: "Local host process (NO isolation)" },
+		{ value: "docker", label: "Docker tools (shared kernel with runc; trusted digest required)" },
 	]);
 	if (!mode) return;
 	if (
@@ -56,7 +57,8 @@ async function configureRuntime(
 		return;
 	}
 	target.runtime = {
-		mode: mode === "inherit" ? undefined : (mode as "local" | "gondolin"),
+		...target.runtime,
+		mode: mode === "inherit" ? undefined : (mode as "local" | "gondolin" | "docker"),
 		workspaceDir: dir.trim() || undefined,
 	};
 	await saveChatConfig(config);
@@ -154,7 +156,11 @@ async function configureSecrets(
 	while (true) {
 		const secrets = current.secrets ?? {};
 		const choice = await selectItem(ctx, title, [
-			{ value: "__add__", label: "+ Add secret", description: "Expose a placeholder env var inside Gondolin" },
+			{
+				value: "__add__",
+				label: "+ Add secret",
+				description: "HTTP proxy secrets (Gondolin / Docker proxy): placeholder only",
+			},
 			...Object.entries(secrets)
 				.sort(([a], [b]) => a.localeCompare(b))
 				.map(([name, secret]) => ({

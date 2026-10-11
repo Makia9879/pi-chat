@@ -1,9 +1,9 @@
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { type Dirent, constants as fsConstants, mkdirSync } from "node:fs";
-import { copyFile, lstat, mkdir, open, readdir, readFile, realpath, writeFile } from "node:fs/promises";
+import { type Dirent, mkdirSync } from "node:fs";
+import { copyFile, lstat, mkdir, readdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import {
 	createBashTool,
@@ -42,6 +42,7 @@ import { connectLive } from "./src/live/index.js";
 import type { LiveConnection } from "./src/live/types.js";
 import { formatModelList, formatModelSwitch, resolveChatModel } from "./src/model-command.js";
 import { ConversationRuntime } from "./src/runtime.js";
+import { safeFile } from "./src/safe-files.js";
 import { clearPendingSecrets, createSecretRequest, tryDecryptSecret, writeRuntimeSecret } from "./src/secrets.js";
 import { formatChangelogExcerpt } from "./src/slash-commands.js";
 import { dispatchSlash, type SlashChoice } from "./src/slash-dispatch.js";
@@ -105,7 +106,18 @@ Your response is sent as the bot's reply to the remote chat.`
 				? "Tools run directly on the host without VM isolation. Use the host OS tools; do not assume Alpine or apk."
 				: "The VM runs Alpine Linux with bash and busybox. Use apk to install packages.",
 		)
-		.replace("On fresh VM,", conversation?.runtimeMode === "local" ? "On a new session," : "On fresh VM,");
+		.replace("On fresh VM,", conversation?.runtimeMode !== "gondolin" ? "On a new session," : "On fresh VM,")
+		.replace(
+			"The VM runs Alpine Linux with bash and busybox. Use apk to install packages.",
+			conversation?.runtimeMode === "docker"
+				? "Tools execute in a non-root Docker container, not a microVM. Root filesystem is read-only; do not install OS packages. Network is disabled except any configured policy proxy. Cancellation or idle stop terminates all background processes."
+				: "The VM runs Alpine Linux with bash and busybox. Use apk to install packages.",
+		)
+		.concat(
+			conversation?.runtimeMode === "docker" && conversation.docker?.sharedReadOnly
+				? "\n/shared is read-only: ignore the shared-memory/skill writing guidance above; write only to /workspace."
+				: "",
+		);
 }
 
 type AssistantSummary = {
@@ -144,17 +156,13 @@ interface WorkerStatusSnapshot {
 	lastRecordId: number;
 	lastError?: string;
 	feishuWs?: FeishuWorkerStatusFields;
+	execution?: Record<string, unknown>;
 }
 
 interface ChatPromptSkill {
 	name: string;
 	description: string;
 	filePath: string;
-}
-
-function isInsideHostPath(root: string, value: string): boolean {
-	const rel = relative(root, value);
-	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
 function escapeXml(value: string): string {
@@ -168,17 +176,7 @@ function escapeXml(value: string): string {
 
 async function safeReadMountedText(root: string, filePath: string): Promise<string> {
 	try {
-		const realRoot = await realpath(root);
-		const resolvedPath = await realpath(filePath);
-		if (!isInsideHostPath(realRoot, resolvedPath)) return "";
-		const handle = await open(resolvedPath, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
-		try {
-			const info = await handle.stat();
-			if (!info.isFile()) return "";
-			return await handle.readFile("utf8");
-		} finally {
-			await handle.close();
-		}
+		return (await safeFile("read", root, filePath)).toString("utf8");
 	} catch {
 		return "";
 	}
@@ -391,7 +389,12 @@ function spawnConversationTmux(_ctx: ExtensionContext, conversation: ResolvedCon
 
 	const sessionDir = join(CHAT_HOME, "tmux-sessions", tmuxName);
 	mkdirSync(conversation.workspaceDir, { recursive: true });
-	const session = SessionManager.continueRecent(conversation.workspaceDir, sessionDir);
+	const workerCwd =
+		conversation.runtimeMode === "docker"
+			? join(conversation.conversationDir, "controller")
+			: conversation.workspaceDir;
+	mkdirSync(workerCwd, { recursive: true, mode: 0o700 });
+	const session = SessionManager.continueRecent(workerCwd, sessionDir);
 	session.appendCustomEntry(SESSION_STATE_CUSTOM_TYPE, { conversationId: conversation.conversationId });
 	session.appendSessionInfo(`pi-chat ${conversation.conversationName}`);
 	const sessionFile = session.getSessionFile();
@@ -404,10 +407,11 @@ function spawnConversationTmux(_ctx: ExtensionContext, conversation: ResolvedCon
 		"--session-dir",
 		shellQuote(sessionDir),
 		...explicitExtensionCommandParts(),
+		...(conversation.runtimeMode === "docker" ? ["--no-approve"] : []),
 		`--${CHAT_CONVERSATION_FLAG}`,
 		shellQuote(conversation.conversationId),
 	].join(" ");
-	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", conversation.workspaceDir, command], {
+	const result = spawnSync("tmux", ["new-session", "-d", "-s", tmuxName, "-c", workerCwd, command], {
 		encoding: "utf8",
 	});
 	if (result.error || result.status !== 0) {
@@ -474,6 +478,15 @@ export default function (pi: ExtensionAPI) {
 		type: "boolean",
 		default: false,
 	});
+	pi.registerFlag("chat-docker", {
+		description: "Standalone Docker tools using root Docker settings",
+		type: "boolean",
+		default: false,
+	});
+	pi.registerFlag("chat-docker-image", {
+		description: "Pinned repository@sha256 image override for --chat-docker",
+		type: "string",
+	});
 	pi.registerFlag("chat-workspace", {
 		description: "Absolute host workspace for --chat-local (default: config runtime.workspaceDir or /workspace)",
 		type: "string",
@@ -495,6 +508,22 @@ export default function (pi: ExtensionAPI) {
 	let pendingChatDispatch = false;
 	let pendingControlAction: (() => Promise<void>) | undefined;
 	let activeTriggerMessageId: string | undefined;
+	let releaseActivity: (() => void) | undefined;
+
+	async function toolTransaction<T>(fn: () => Promise<T>): Promise<T> {
+		ensureExecutionAvailable();
+		return sandbox?.withToolTransaction ? sandbox.withToolTransaction(fn) : fn();
+	}
+	async function closeExecution(current: ConversationExecution): Promise<void> {
+		try {
+			await current.close();
+		} catch (error) {
+			if (current.mode === "docker") {
+				executionError = "Docker cleanup failed; ownership retained for reconciliation";
+				throw error;
+			}
+		}
+	}
 
 	function persistChatState(conversationId?: string): void {
 		pi.appendEntry<PersistedChatState>(SESSION_STATE_CUSTOM_TYPE, { conversationId });
@@ -554,6 +583,10 @@ export default function (pi: ExtensionAPI) {
 	async function createBashDelegate(ctx: ExtensionContext) {
 		ensureExecutionAvailable();
 		if (!isSandboxActive() || !sandbox) return createBashTool(getLocalToolCwd(ctx));
+		if (sandbox.mode === "docker") {
+			const { dockerBashTool } = await import("./src/docker-output.js");
+			return dockerBashTool(sandbox);
+		}
 		return createBashTool(sandbox.workspacePath, { operations: await sandbox.createBashOperations() });
 	}
 
@@ -804,6 +837,7 @@ export default function (pi: ExtensionAPI) {
 		const link = liveConnection?.connectionStatus?.();
 		if (link) lines.push(formatFeishuConnectionStatus(link));
 		if (!runtime && sandbox) lines.push(`Runtime: ${sandbox.mode}; workspace: ${sandbox.workspacePath}`);
+		if (sandbox?.getStatus) lines.push(`Execution: ${JSON.stringify(sandbox.getStatus())}`);
 		return lines.join("\n") || "No usage data yet.";
 	}
 
@@ -811,6 +845,13 @@ export default function (pi: ExtensionAPI) {
 		const config = await loadChatConfig();
 		const conversation = resolveConversation(config, conversationId);
 		if (!conversation) return false;
+		if (sandbox?.mode === "docker" || conversation.runtimeMode === "docker") {
+			executionRequired = true;
+			executionError = "Docker replacement in progress";
+			const previous = sandbox;
+			sandbox = undefined;
+			if (previous) await closeExecution(previous);
+		}
 		const nextSandbox = await createConversationExecution(conversation);
 		try {
 			if (conversation.runtimeMode === "gondolin") await prepareGondolin(ctx);
@@ -824,6 +865,7 @@ export default function (pi: ExtensionAPI) {
 		}
 		const previousSandbox = sandbox;
 		sandbox = nextSandbox;
+		executionError = undefined;
 		if (runtime && runtime.conversation.conversationId === conversation.conversationId) {
 			Object.assign(runtime.conversation, conversation);
 		}
@@ -838,6 +880,8 @@ export default function (pi: ExtensionAPI) {
 		conversationId: string,
 		interactive = true,
 	): Promise<boolean> {
+		executionRequired = true;
+		executionError = "Connection execution is not ready";
 		const config = await loadChatConfig();
 		const conversation = resolveConversation(config, conversationId);
 		if (!conversation) {
@@ -857,6 +901,7 @@ export default function (pi: ExtensionAPI) {
 			runtime = await ConversationRuntime.connect(conversation, ownerId);
 			sandbox = await createConversationExecution(conversation);
 			await sandbox.start();
+			executionError = undefined;
 			liveConnection = await connectLive(
 				conversation,
 				{
@@ -977,6 +1022,10 @@ export default function (pi: ExtensionAPI) {
 											runtime.conversation.workspaceDir,
 											`session-${ctx.sessionManager.getSessionId()}.jsonl`,
 										);
+										if (runtime.conversation.runtimeMode === "docker") {
+											await safeFile("write", runtime.conversation.workspaceDir, target, await readFile(source));
+											return sandbox?.stageAttachment(displayPath(runtime.conversation, target));
+										}
 										await mkdir(runtime.conversation.workspaceDir, { recursive: true });
 										await copyFile(source, target);
 										return target;
@@ -1020,12 +1069,13 @@ export default function (pi: ExtensionAPI) {
 			);
 		});
 		if (result.error) {
+			executionError = "Connection startup failed; execution unavailable";
 			if (liveConnection) {
 				await liveConnection.disconnect().catch(() => undefined);
 				liveConnection = undefined;
 			}
 			if (sandbox) {
-				await sandbox.close().catch(() => undefined);
+				await closeExecution(sandbox);
 				sandbox = undefined;
 			}
 			if (runtime) await runtime.disconnect().catch(() => undefined);
@@ -1096,6 +1146,7 @@ export default function (pi: ExtensionAPI) {
 			recordCount: status.recordCount,
 			lastRecordId: status.lastRecordId,
 			lastError: error,
+			execution: sandbox?.getStatus?.(),
 		};
 		const link = liveConnection?.connectionStatus?.();
 		if (link) snapshot.feishuWs = feishuWorkerStatusFields(link);
@@ -1388,6 +1439,7 @@ export default function (pi: ExtensionAPI) {
 			return;
 		}
 		try {
+			releaseActivity = sandbox?.holdActivity?.();
 			chatTurnInFlight = true;
 			activeTriggerMessageId = next.triggerMessageId;
 			queuedOutboundAttachments = [];
@@ -1402,12 +1454,16 @@ export default function (pi: ExtensionAPI) {
 			stopTypingLoop();
 			await markLiveOutcome("failure");
 			const message = error instanceof Error ? error.message : String(error);
+			releaseActivity?.();
+			releaseActivity = undefined;
 			await runtime.failActiveJob(`dispatch failed: ${message}`);
 			updateStatus(ctx, message);
 		}
 	}
 
 	async function disconnectRuntime(ctx: ExtensionContext, clearPersistedState = true): Promise<void> {
+		releaseActivity?.();
+		releaseActivity = undefined;
 		stopTypingLoop();
 		stopWorkerStatusLoop();
 		clearPendingSecrets(runtime?.conversation.conversationId);
@@ -1417,7 +1473,7 @@ export default function (pi: ExtensionAPI) {
 		if (connection) await connection.disconnect().catch(() => undefined);
 		const currentSandbox = sandbox;
 		sandbox = undefined;
-		if (currentSandbox) await currentSandbox.close().catch(() => undefined);
+		if (currentSandbox) await closeExecution(currentSandbox);
 		if (!runtime) {
 			updateStatus(ctx);
 			return;
@@ -1431,7 +1487,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	pi.on("tool_call", async (event) => {
-		if (!chatTurnInFlight) return;
+		if (!chatTurnInFlight && !executionRequired) return;
 		if (
 			["read", "write", "edit", "bash", "chat_attach", "chat_history", "chat_request_secret"].includes(event.toolName)
 		)
@@ -1454,6 +1510,19 @@ export default function (pi: ExtensionAPI) {
 			const updatedConversation = resolveConversation(updatedConfig, conversationId);
 			if (!updatedConversation) return;
 			const afterSecrets = stableSecretsKey(updatedConversation.gondolinSecrets);
+			if (runtime.conversation.runtimeMode === "docker" || updatedConversation.runtimeMode === "docker") {
+				if (
+					JSON.stringify(runtime.conversation.docker) !== JSON.stringify(updatedConversation.docker) ||
+					runtime.conversation.runtimeMode !== updatedConversation.runtimeMode ||
+					runtime.conversation.workspaceDir !== updatedConversation.workspaceDir ||
+					beforeSecrets !== afterSecrets
+				) {
+					executionError = "Docker settings changed; disconnect and reconnect to apply";
+					ctx.abort();
+					ctx.ui.notify(executionError, "warning");
+				}
+				return;
+			}
 			if (beforeSecrets === afterSecrets) return;
 			const confirm = await ctx.ui.confirm(
 				"Restart sandbox",
@@ -1680,6 +1749,16 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		if (
+			pi.getFlag("chat-local") === true ||
+			pi.getFlag("chat-docker") === true ||
+			pi.getFlag("chat-docker-image") !== undefined ||
+			pi.getFlag(CHAT_CONVERSATION_FLAG)
+		) {
+			executionRequired = true;
+			executionError = "Execution startup incomplete";
+			pi.setActiveTools(["read", "write", "edit", "bash"]);
+		}
 		await loadConfigOnce();
 		ownerId = `pi-chat-${process.pid}-${randomUUID()}`;
 		const readDefinition = createReadToolDefinition(ctx.cwd);
@@ -1689,29 +1768,25 @@ export default function (pi: ExtensionAPI) {
 		pi.registerTool({
 			...readDefinition,
 			async execute(id, params, signal, onUpdate, toolCtx) {
-				const tool = await createReadDelegate(toolCtx);
-				return tool.execute(id, params, signal, onUpdate);
+				return toolTransaction(async () => (await createReadDelegate(toolCtx)).execute(id, params, signal, onUpdate));
 			},
 		});
 		pi.registerTool({
 			...writeDefinition,
 			async execute(id, params, signal, onUpdate, toolCtx) {
-				const tool = await createWriteDelegate(toolCtx);
-				return tool.execute(id, params, signal, onUpdate);
+				return toolTransaction(async () => (await createWriteDelegate(toolCtx)).execute(id, params, signal, onUpdate));
 			},
 		});
 		pi.registerTool({
 			...editDefinition,
 			async execute(id, params, signal, onUpdate, toolCtx) {
-				const tool = await createEditDelegate(toolCtx);
-				return tool.execute(id, params, signal, onUpdate);
+				return toolTransaction(async () => (await createEditDelegate(toolCtx)).execute(id, params, signal, onUpdate));
 			},
 		});
 		pi.registerTool({
 			...bashDefinition,
 			async execute(id, params, signal, onUpdate, toolCtx) {
-				const tool = await createBashDelegate(toolCtx);
-				return tool.execute(id, params, signal, onUpdate);
+				return toolTransaction(async () => (await createBashDelegate(toolCtx)).execute(id, params, signal, onUpdate));
 			},
 		});
 		pi.setActiveTools([
@@ -1732,7 +1807,55 @@ export default function (pi: ExtensionAPI) {
 			typeof flaggedConversationId === "string" && flaggedConversationId.trim()
 				? flaggedConversationId.trim()
 				: persistedConversationId;
-		if (pi.getFlag("chat-local") === true) {
+		const dockerFlag = pi.getFlag("chat-docker") === true;
+		const localFlag = pi.getFlag("chat-local") === true;
+		if (
+			(dockerFlag && localFlag) ||
+			((dockerFlag || localFlag) && flaggedConversationId) ||
+			(!dockerFlag && pi.getFlag("chat-docker-image") !== undefined)
+		) {
+			executionRequired = true;
+			executionError = "Invalid standalone execution flag combination";
+			pi.setActiveTools(["read", "write", "edit", "bash"]);
+			throw new Error(executionError);
+		}
+		if (dockerFlag) {
+			executionRequired = true;
+			pi.setActiveTools(["read", "write", "edit", "bash"]);
+			try {
+				const config = await loadChatConfig();
+				const { resolveDockerSettings } = await import("./src/docker-config.js");
+				const { DockerExecution } = await import("./src/docker.js");
+				const root = join(CHAT_HOME, "docker-standalone");
+				const requested = pi.getFlag("chat-workspace");
+				const workspaceDir =
+					typeof requested === "string" ? requested : (config.runtime?.workspaceDir ?? join(root, "workspace"));
+				if (!isAbsolute(workspaceDir)) throw new Error("--chat-workspace must be absolute");
+				const image = pi.getFlag("chat-docker-image");
+				const secrets = config.gondolin?.secrets ?? {};
+				const pending = new DockerExecution({
+					workspaceDir,
+					sharedDir: join(root, "shared"),
+					dockerDir: join(root, "metadata"),
+					gondolinSecrets: secrets,
+					docker: resolveDockerSettings(
+						[config.runtime?.docker, typeof image === "string" ? { image } : undefined],
+						secrets,
+					),
+				});
+				sandbox = pending;
+				await pending.start();
+				executionError = undefined;
+				ctx.ui.setStatus("chat", "chat docker: /workspace");
+			} catch (error) {
+				executionError = error instanceof Error ? error.message : "Docker startup failed";
+				if (sandbox) await closeExecution(sandbox);
+				sandbox = undefined;
+				throw new Error(executionError);
+			}
+			return;
+		}
+		if (localFlag) {
 			executionRequired = true;
 			const failLocal = (message: string): never => {
 				executionError = message;
@@ -1762,6 +1885,7 @@ export default function (pi: ExtensionAPI) {
 				failLocal(error instanceof Error ? error.message : String(error));
 			}
 			sandbox = pending;
+			executionError = undefined;
 			pi.setActiveTools(["read", "write", "edit", "bash"]);
 			ctx.ui.setStatus("chat", `chat local (unsandboxed): ${sandbox.workspacePath}`);
 			return;
@@ -1774,7 +1898,15 @@ export default function (pi: ExtensionAPI) {
 		await disconnectRuntime(ctx, reason === "quit");
 	});
 
-	pi.on("agent_start", async (_event, _ctx) => {});
+	pi.on("agent_start", async () => {
+		releaseActivity ??= sandbox?.holdActivity?.();
+	});
+	pi.on("user_bash", async () => {
+		if (!executionRequired && !sandbox) return;
+		ensureExecutionAvailable();
+		if (!sandbox) throw new Error("Execution unavailable");
+		return { operations: await sandbox.createBashOperations() };
+	});
 
 	pi.on("context", async (event) => {
 		return {
@@ -1806,78 +1938,84 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
-		if (!runtime || !chatTurnInFlight) {
-			stopTypingLoop();
-			updateStatus(ctx);
-			return;
-		}
-		const summary = extractAssistantSummary(event.messages as unknown[]);
-		if (summary.stopReason === "aborted") {
-			stopTypingLoop();
-			await markLiveOutcome("cancelled");
-			chatTurnInFlight = false;
-			await runtime.failActiveJob("aborted");
-			const action = pendingControlAction;
-			pendingControlAction = undefined;
-			if (action) {
-				await action();
+		const release = releaseActivity;
+		releaseActivity = undefined;
+		try {
+			if (!runtime || !chatTurnInFlight) {
+				stopTypingLoop();
 				updateStatus(ctx);
 				return;
 			}
-			updateStatus(ctx);
-			await tryDispatch(ctx);
-			return;
-		}
-		if (summary.stopReason === "error" || summary.stopReason === "length") {
-			stopTypingLoop();
-			await markLiveOutcome("failure");
-			chatTurnInFlight = false;
-			const errorMessage = summary.errorMessage || `agent ${summary.stopReason}`;
-			await runtime.failActiveJob(errorMessage);
-			if (liveConnection) {
-				try {
-					await liveConnection.sendImmediate(`pi-chat error: ${errorMessage}`);
-				} catch {
-					// ignore secondary send failure
-				}
-			}
-			ctx.ui.notify(errorMessage, "error");
-			updateStatus(ctx, errorMessage);
-			await tryDispatch(ctx);
-			return;
-		}
-		stopTypingLoop();
-		let remoteMessageId: string | undefined;
-		const attachmentPaths = [...queuedOutboundAttachments];
-		queuedOutboundAttachments = [];
-		const finalText = summary.text || (attachmentPaths.length > 0 ? "Attached requested file(s)." : "");
-		if (liveConnection && finalText) {
-			try {
-				remoteMessageId = await Promise.race([
-					liveConnection.send(finalText, attachmentPaths, ctx.signal, activeTriggerMessageId),
-					new Promise<string>((_, reject) => setTimeout(() => reject(new Error("send timed out")), 120000)),
-					waitForAbort(ctx.signal),
-				]);
-			} catch (error) {
-				const message = error instanceof Error ? error.message : String(error);
+			const summary = extractAssistantSummary(event.messages as unknown[]);
+			if (summary.stopReason === "aborted") {
+				stopTypingLoop();
+				await markLiveOutcome("cancelled");
 				chatTurnInFlight = false;
-				if (error instanceof Error && error.name === "AbortError") {
-					await markLiveOutcome("cancelled");
-					await runtime.failActiveJob("aborted");
+				await runtime.failActiveJob("aborted");
+				const action = pendingControlAction;
+				pendingControlAction = undefined;
+				if (action) {
+					await action();
 					updateStatus(ctx);
-					await tryDispatch(ctx);
 					return;
 				}
-				await markLiveOutcome("failure");
-				await runtime.failActiveJob(`send failed: ${message}`);
-				updateStatus(ctx, message);
+				updateStatus(ctx);
 				await tryDispatch(ctx);
 				return;
 			}
+			if (summary.stopReason === "error" || summary.stopReason === "length") {
+				stopTypingLoop();
+				await markLiveOutcome("failure");
+				chatTurnInFlight = false;
+				const errorMessage = summary.errorMessage || `agent ${summary.stopReason}`;
+				await runtime.failActiveJob(errorMessage);
+				if (liveConnection) {
+					try {
+						await liveConnection.sendImmediate(`pi-chat error: ${errorMessage}`);
+					} catch {
+						// ignore secondary send failure
+					}
+				}
+				ctx.ui.notify(errorMessage, "error");
+				updateStatus(ctx, errorMessage);
+				await tryDispatch(ctx);
+				return;
+			}
+			stopTypingLoop();
+			let remoteMessageId: string | undefined;
+			const attachmentPaths = [...queuedOutboundAttachments];
+			queuedOutboundAttachments = [];
+			const finalText = summary.text || (attachmentPaths.length > 0 ? "Attached requested file(s)." : "");
+			if (liveConnection && finalText) {
+				try {
+					remoteMessageId = await Promise.race([
+						liveConnection.send(finalText, attachmentPaths, ctx.signal, activeTriggerMessageId),
+						new Promise<string>((_, reject) => setTimeout(() => reject(new Error("send timed out")), 120000)),
+						waitForAbort(ctx.signal),
+					]);
+				} catch (error) {
+					const message = error instanceof Error ? error.message : String(error);
+					chatTurnInFlight = false;
+					if (error instanceof Error && error.name === "AbortError") {
+						await markLiveOutcome("cancelled");
+						await runtime.failActiveJob("aborted");
+						updateStatus(ctx);
+						await tryDispatch(ctx);
+						return;
+					}
+					await markLiveOutcome("failure");
+					await runtime.failActiveJob(`send failed: ${message}`);
+					updateStatus(ctx, message);
+					await tryDispatch(ctx);
+					return;
+				}
+			}
+			chatTurnInFlight = false;
+			await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
+			updateStatus(ctx);
+			await tryDispatch(ctx);
+		} finally {
+			release?.();
 		}
-		chatTurnInFlight = false;
-		await runtime.completeActiveJob(finalText, remoteMessageId, attachmentPaths);
-		updateStatus(ctx);
-		await tryDispatch(ctx);
 	});
 }

@@ -1,6 +1,6 @@
 import { constants, createDecipheriv, generateKeyPairSync, privateDecrypt } from "node:crypto";
-import { chmod, mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
+import { safeFile } from "./safe-files.js";
 
 const SECRET_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/;
 
@@ -45,11 +45,9 @@ export function clearPendingSecrets(conversationId?: string): void {
 export async function writeRuntimeSecret(workspaceDir: string, name: string, content: string): Promise<string> {
 	if (!SECRET_NAME.test(name)) throw new Error("Secret name must be a simple filename");
 	const dir = join(workspaceDir, ".secrets");
-	await mkdir(dir, { recursive: true, mode: 0o700 });
-	await chmod(dir, 0o700);
+	await safeFile("mkdir", workspaceDir, dir);
 	const target = join(dir, name);
-	await writeFile(target, content, { encoding: "utf8", mode: 0o600 });
-	await chmod(target, 0o600);
+	await safeFile("secret", workspaceDir, target, Buffer.from(content));
 	return target;
 }
 

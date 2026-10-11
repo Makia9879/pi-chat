@@ -10,6 +10,8 @@ import type {
 	StoredAttachment,
 } from "../types.js";
 
+import { safeFile } from "./safe-files.js";
+
 function guessAttachmentKind(path: string): AttachmentKind {
 	const ext = extname(path).toLowerCase();
 	if ([".png", ".jpg", ".jpeg", ".gif", ".webp"].includes(ext)) return "image";
@@ -62,9 +64,17 @@ export async function ensureConversationDirs(conversation: ResolvedConversation)
 	await mkdir(dirname(conversation.lockPath), { recursive: true });
 	await mkdir(conversation.workspaceDir, { recursive: true });
 	await mkdir(conversation.gondolinDir, { recursive: true });
-	await mkdir(conversation.filesDir, { recursive: true });
-	await ensureRegularFile(conversation.accountMemoryPath);
-	await ensureRegularFile(conversation.channelMemoryPath);
+	if (conversation.runtimeMode === "docker") {
+		if (!conversation.dockerDir) throw new Error("Docker metadata directory missing");
+		await mkdir(conversation.dockerDir, { recursive: true, mode: 0o700 });
+		await safeFile("mkdir", conversation.workspaceDir, conversation.filesDir);
+		await safeFile("touch", conversation.sharedDir, conversation.accountMemoryPath);
+		await safeFile("touch", conversation.workspaceDir, conversation.channelMemoryPath);
+	} else {
+		await mkdir(conversation.filesDir, { recursive: true });
+		await ensureRegularFile(conversation.accountMemoryPath);
+		await ensureRegularFile(conversation.channelMemoryPath);
+	}
 }
 
 export async function readConversationLog(conversation: ResolvedConversation): Promise<ChatLogRecord[]> {
@@ -212,7 +222,12 @@ export async function materializeAttachments(
 		const targetPath = isInside(conversation.filesDir, attachment.path)
 			? attachment.path
 			: join(conversation.filesDir, `${Date.now()}-${messageId}-${index + 1}-${fileName}`);
-		if (targetPath !== attachment.path) await copyFile(attachment.path, targetPath);
+		if (targetPath !== attachment.path) {
+			if (conversation.runtimeMode === "docker") {
+				const bytes = await safeFile("read", dirname(attachment.path), attachment.path);
+				await safeFile("write", conversation.workspaceDir, targetPath, bytes);
+			} else await copyFile(attachment.path, targetPath);
+		}
 		stored.push({
 			kind: attachment.kind || guessAttachmentKind(attachment.path),
 			name: fileName,

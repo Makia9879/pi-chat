@@ -18,6 +18,7 @@ export async function fixture(input = config()) {
 		conversationDir: join(root, "channel"),
 		workspaceDir: join(root, "work"),
 		gondolinDir: join(root, "vm"),
+		dockerDir: join(root, "docker"),
 		accountMemoryPath: join(root, "shared", "memory.md"),
 		channelMemoryPath: join(root, "work", "memory.md"),
 		logPath: join(root, "channel", "channel.jsonl"),

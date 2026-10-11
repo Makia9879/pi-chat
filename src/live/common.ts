@@ -2,6 +2,7 @@ import { lstat, mkdir, readFile, writeFile } from "node:fs/promises";
 import { basename, extname, join } from "node:path";
 import type { ResolvedConversation } from "../core/config-types.js";
 import type { AttachmentInput } from "../core/runtime-types.js";
+import { safeFile } from "../safe-files.js";
 
 function sanitize(value: string): string {
 	return value.replace(/[^a-zA-Z0-9._-]+/g, "_");
@@ -16,10 +17,13 @@ export async function storeDownloadedAttachment(
 	mimeType?: string,
 	remoteUrl?: string,
 ): Promise<AttachmentInput> {
-	await mkdir(conversation.filesDir, { recursive: true });
+	if (conversation.runtimeMode === "docker") await safeFile("mkdir", conversation.workspaceDir, conversation.filesDir);
+	else await mkdir(conversation.filesDir, { recursive: true });
 	const safeName = sanitize(fileName || `attachment-${index}`);
-	const targetPath = join(conversation.filesDir, `incoming-${Date.now()}-${messageId}-${index}-${safeName}`);
-	await writeFile(targetPath, data);
+	const targetPath = join(conversation.filesDir, `incoming-${Date.now()}-${sanitize(messageId)}-${index}-${safeName}`);
+	if (conversation.runtimeMode === "docker")
+		await safeFile("write", conversation.workspaceDir, targetPath, Buffer.from(data));
+	else await writeFile(targetPath, data);
 	return {
 		path: targetPath,
 		name: basename(targetPath),

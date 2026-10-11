@@ -5,7 +5,10 @@ import type { ResolvedConversation } from "./core/config-types.js";
 export interface ConversationExecution {
 	readonly workspacePath: string;
 	readonly sharedPath: string;
-	readonly mode: "gondolin" | "local";
+	readonly mode: "gondolin" | "local" | "docker";
+	holdActivity?(): () => void;
+	getStatus?(): Record<string, unknown>;
+	withToolTransaction?<T>(fn: () => Promise<T>): Promise<T>;
 	start(): Promise<unknown>;
 	close(): Promise<void>;
 	stageAttachment(path: string): Promise<string>;
@@ -20,8 +23,15 @@ export async function createConversationExecution(conversation: ResolvedConversa
 		const { LocalExecution } = await import("./local.js");
 		return new LocalExecution(conversation);
 	}
-	const { ConversationSandbox } = await import("./gondolin.js");
-	return new ConversationSandbox(conversation);
+	if (conversation.runtimeMode === "docker") {
+		const { DockerExecution } = await import("./docker.js");
+		return new DockerExecution(conversation);
+	}
+	if (conversation.runtimeMode === "gondolin") {
+		const { ConversationSandbox } = await import("./gondolin.js");
+		return new ConversationSandbox(conversation);
+	}
+	throw new Error("Unsupported execution mode");
 }
 
 export function displayPath(conversation: ResolvedConversation, hostPath: string): string {

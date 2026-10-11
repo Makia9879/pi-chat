@@ -11,5 +11,5 @@ export function executionSystemPrompt(
 		.replace(
 			`<cwd>\n${cwd}\n</cwd>`,
 			`<cwd>\n${execution.workspacePath}\n</cwd>`,
-		)}\n\npi-chat tool environment: ${execution.mode === "local" ? "local host processes (NOT sandboxed)" : "Gondolin VM"}. Working directory: ${execution.workspacePath}. Shared files: ${execution.sharedPath}.`;
+		)}\n\npi-chat tool environment: ${execution.mode === "local" ? "local host processes (NOT sandboxed)" : execution.mode === "docker" ? "Docker container (not a microVM), non-root, read-only root filesystem, network-none; optional host-policy HTTP(S) proxy. Do not install system packages. Cancellation and idle stop kill all background processes. Treat /shared as read-only unless explicitly configured otherwise" : "Gondolin VM"}. Working directory: ${execution.workspacePath}. Shared files: ${execution.sharedPath}.`;
 }

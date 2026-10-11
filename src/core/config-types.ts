@@ -1,7 +1,10 @@
+import type { DockerConfig, DockerSettings } from "../docker-config.js";
+
 export type ChatService = "telegram" | "discord" | "feishu";
 
 export interface RuntimeConfig {
-	mode?: "gondolin" | "local";
+	mode?: "gondolin" | "local" | "docker";
+	docker?: DockerConfig;
 	/** Absolute host directory. Local mode defaults to /workspace. */
 	workspaceDir?: string;
 }
@@ -122,7 +125,9 @@ export interface ChatConfig {
 }
 
 export interface ResolvedConversation {
-	runtimeMode: "gondolin" | "local";
+	runtimeMode: "gondolin" | "local" | "docker";
+	docker?: DockerSettings;
+	dockerDir?: string;
 	workspacePath: string;
 	sharedPath: string;
 	service: ChatService;

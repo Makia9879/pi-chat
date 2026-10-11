@@ -1,4 +1,4 @@
-import { chmod, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 
@@ -11,6 +11,8 @@ import type {
 	GondolinSecretConfig,
 	ResolvedConversation,
 } from "./core/config-types.js";
+
+import { resolveDockerSettings, validateRuntimeConfig } from "./docker-config.js";
 
 export const CHAT_HOME = join(homedir(), ".pi", "agent", "chat");
 export const CHAT_CONFIG_PATH = join(CHAT_HOME, "config.json");
@@ -60,12 +62,14 @@ function buildResolvedConversation(
 	if (!account) throw new Error(`Unknown account: ${accountId}`);
 	const accountDir = getAccountStorageDir(accountId);
 	const conversationDir = getChannelStorageDir(accountId, channelKey);
+	for (const layer of [config.runtime, account.runtime, channel.runtime]) validateRuntimeConfig(layer);
 	const runtime = {
 		mode: channel.runtime?.mode ?? account.runtime?.mode ?? config.runtime?.mode,
 		workspaceDir: channel.runtime?.workspaceDir ?? account.runtime?.workspaceDir ?? config.runtime?.workspaceDir,
 	};
 	const runtimeMode = runtime.mode ?? "gondolin";
-	if (runtimeMode !== "local" && runtimeMode !== "gondolin") throw new Error(`Unknown runtime mode: ${runtimeMode}`);
+	if (runtimeMode !== "local" && runtimeMode !== "gondolin" && runtimeMode !== "docker")
+		throw new Error(`Unknown runtime mode: ${runtimeMode}`);
 	if (runtime.workspaceDir !== undefined && !isAbsolute(runtime.workspaceDir))
 		throw new Error("runtime.workspaceDir must be an absolute host path");
 	const workspaceDir = resolve(
@@ -74,6 +78,15 @@ function buildResolvedConversation(
 	const sharedDir = join(accountDir, "shared");
 	return {
 		runtimeMode,
+		...(runtimeMode === "docker"
+			? {
+					docker: resolveDockerSettings(
+						[config.runtime?.docker, account.runtime?.docker, channel.runtime?.docker],
+						mergeGondolinSecrets(config.gondolin, account.gondolin, channel.gondolin),
+					),
+					dockerDir: join(conversationDir, "docker"),
+				}
+			: {}),
 		workspacePath: runtimeMode === "local" ? workspaceDir : "/workspace",
 		sharedPath: runtimeMode === "local" ? sharedDir : "/shared",
 		service: account.service,
@@ -104,12 +117,30 @@ export async function ensureChatHome(): Promise<void> {
 	await mkdir(CHAT_CACHE_DIR, { recursive: true });
 }
 
+async function refuseRetainedDocker(directory: string): Promise<void> {
+	try {
+		const meta = JSON.parse(await readFile(join(directory, "docker", "session.json"), "utf8")) as {
+			id?: string;
+			state?: string;
+		};
+		if (meta.id || meta.state !== "closed")
+			throw new Error(
+				"Docker resources may still own this storage. Explicitly close/remove and reconcile before deletion.",
+			);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+	}
+}
+
 export async function removeAccountStorage(accountId: string, _cwd: string): Promise<void> {
+	const channels = join(getAccountStorageDir(accountId), "channels");
+	for (const entry of await readdir(channels).catch(() => [])) await refuseRetainedDocker(join(channels, entry));
 	await rm(getAccountStorageDir(accountId), { recursive: true, force: true });
 	await rm(join(CHAT_CACHE_DIR, `${sanitizePathSegment(accountId)}.json`), { force: true });
 }
 
 export async function removeChannelStorage(accountId: string, channelKey: string, _cwd: string): Promise<void> {
+	await refuseRetainedDocker(getChannelStorageDir(accountId, channelKey));
 	await rm(getChannelStorageDir(accountId, channelKey), { recursive: true, force: true });
 }
 
@@ -129,13 +160,19 @@ export async function loadChatConfig(): Promise<ChatConfig> {
 	try {
 		const content = await readFile(CHAT_CONFIG_PATH, "utf8");
 		const parsed = JSON.parse(content) as ChatConfig;
+		validateRuntimeConfig(parsed.runtime);
+		for (const account of Object.values(parsed.accounts ?? {})) {
+			validateRuntimeConfig(account.runtime);
+			for (const channel of Object.values(account.channels ?? {})) validateRuntimeConfig(channel.runtime);
+		}
 		return {
 			botName: parsed.botName?.trim() || "pi",
 			gondolin: parsed.gondolin,
 			runtime: parsed.runtime,
 			accounts: (parsed.accounts ?? {}) as Record<string, ChatAccountConfig>,
 		};
-	} catch {
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
 		return { botName: "pi", accounts: {} };
 	}
 }
